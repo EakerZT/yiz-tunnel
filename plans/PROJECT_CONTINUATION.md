@@ -298,6 +298,8 @@
 - 已实现活动连接归零后自动从 `stopping` 切换为 `stopped`。
 - 已新增 http-server stop 状态切换自动测试。
 - 已运行 `cargo test`，当前 27 个测试通过。
+- 已新增根目录 `README.md`，作为项目首页和第一版能力说明入口。
+- `README.md` 已覆盖项目定位、文档入口、构建启动、配置目录、已支持能力、自动验证、第一版限制和开发约定。
 - 当前尚未实现更完整的 nginx proxy header 行为。
 - 已创建管理 API 接口文档 `docs/MANAGEMENT_API.md`。
 
@@ -404,6 +406,7 @@
 - 技术选型：核心转发部分尽量不使用外部依赖；管理 API 可以使用外部 HTTP 服务库。
 - HTTP MVP：`tcp-forward` 暂不进入最小可用实现，先实现 HTTP/1.1、管理 API、静态文件、反向代理、WebSocket、日志和状态查询。
 - Proxy：除明确要求外参考 nginx；WebSocket 第一版实现且默认开启。
+- Proxy rewrite：已确认 `action.proxy.rewrite` 放在 proxy 下，当前实现 `replacePrefix`，用于转发前替换 path 前缀，query string 保留；未来类型可继续扩展但当前会拒绝未知类型。
 - 依赖：事件调度用 `tokio`，JSON 用 `serde_json`，管理 API 用 `axum`，后续 TLS 用 `rustls`，请求头解析自行实现。
 - TCP 转发管理 API：第一阶段暂不讨论。
 - reload/retry：需要支持重新应用已保存配置。

@@ -180,6 +180,15 @@ pub struct ProxyAction {
     pub upstream: String,
     #[serde(default)]
     pub websocket: WebSocketConfig,
+    #[serde(default)]
+    pub rewrite: Option<ProxyRewrite>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProxyRewrite {
+    pub r#type: String,
+    pub from: String,
+    pub to: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -16,8 +16,8 @@ use tokio::time::timeout;
 use crate::error::ApiError;
 use crate::logger::{AccessLogEntry, LogManager};
 use crate::model::{
-    FileAction, HttpServerConfig, HttpServerInfo, ProxyAction, RouteConfig, UpstreamConfig,
-    UpstreamInfo,
+    FileAction, HttpServerConfig, HttpServerInfo, ProxyAction, ProxyRewrite, RouteConfig,
+    UpstreamConfig, UpstreamInfo,
 };
 
 #[derive(Clone)]
@@ -1404,7 +1404,13 @@ async fn serve_proxy(
     let _upstream_request_guard = proxy_state.increment_upstream_request(&upstream.id);
 
     let is_websocket = proxy.websocket.enabled && request_is_websocket(request);
-    let request_bytes = build_proxy_request(request, &host, remote_address, is_websocket);
+    let request_bytes = build_proxy_request(
+        request,
+        &host,
+        remote_address,
+        is_websocket,
+        proxy.rewrite.as_ref(),
+    );
     timed_write_all(
         &mut upstream_stream,
         &request_bytes,
@@ -1656,14 +1662,12 @@ fn build_proxy_request(
     upstream_host: &str,
     remote_address: &str,
     websocket: bool,
+    rewrite: Option<&ProxyRewrite>,
 ) -> Vec<u8> {
     let mut result = Vec::new();
+    let target = proxy_target(request, rewrite);
     result.extend_from_slice(
-        format!(
-            "{} {} {}\r\n",
-            request.method, request.target, request.version
-        )
-        .as_bytes(),
+        format!("{} {} {}\r\n", request.method, target, request.version).as_bytes(),
     );
 
     let mut wrote_host = false;
@@ -1728,6 +1732,29 @@ fn build_proxy_request(
     result.extend_from_slice(b"\r\n");
     result.extend_from_slice(&request.body);
     result
+}
+
+fn proxy_target(request: &HttpRequest, rewrite: Option<&ProxyRewrite>) -> String {
+    let (path, query) = request
+        .target
+        .split_once('?')
+        .map(|(path, query)| (path, Some(query)))
+        .unwrap_or((request.target.as_str(), None));
+
+    let path = rewrite_proxy_path(path, rewrite).unwrap_or_else(|| path.to_string());
+    match query {
+        Some(query) => format!("{path}?{query}"),
+        None => path,
+    }
+}
+
+fn rewrite_proxy_path(path: &str, rewrite: Option<&ProxyRewrite>) -> Option<String> {
+    let rewrite = rewrite?;
+    if rewrite.r#type != "replacePrefix" || !path.starts_with(&rewrite.from) {
+        return None;
+    }
+
+    Some(format!("{}{}", rewrite.to, &path[rewrite.from.len()..]))
 }
 
 async fn write_simple_response(
@@ -1868,13 +1895,42 @@ mod tests {
             body_complete: true,
         };
 
-        let raw = build_proxy_request(&request, "127.0.0.1", "127.0.0.2:50100", false);
+        let raw = build_proxy_request(&request, "127.0.0.1", "127.0.0.2:50100", false, None);
         let text = String::from_utf8(raw).unwrap();
 
         assert!(text.contains("Host: 127.0.0.1\r\n"));
         assert!(text.contains("X-Real-IP: 127.0.0.2\r\n"));
         assert!(text.contains("X-Forwarded-For: 10.0.0.1, 127.0.0.2\r\n"));
         assert!(text.contains("X-Forwarded-Proto: http\r\n"));
+    }
+
+    #[test]
+    fn proxy_rewrite_replace_prefix_preserves_query() {
+        let request = HttpRequest {
+            method: "GET".to_string(),
+            target: "/123456789012345/a.png?v=1".to_string(),
+            version: "HTTP/1.1".to_string(),
+            headers: vec![("Host".to_string(), "example.test".to_string())],
+            body: Vec::new(),
+            content_length: None,
+            body_complete: true,
+        };
+        let rewrite = ProxyRewrite {
+            r#type: "replacePrefix".to_string(),
+            from: "/123456789012345/".to_string(),
+            to: "/".to_string(),
+        };
+
+        let raw = build_proxy_request(
+            &request,
+            "127.0.0.1",
+            "127.0.0.2:50100",
+            false,
+            Some(&rewrite),
+        );
+        let text = String::from_utf8(raw).unwrap();
+
+        assert!(text.starts_with("GET /a.png?v=1 HTTP/1.1\r\n"));
     }
 
     #[tokio::test]
@@ -2048,6 +2104,7 @@ mod tests {
                 proxy: Some(ProxyAction {
                     upstream: "api".to_string(),
                     websocket: WebSocketConfig { enabled: true },
+                    rewrite: None,
                 }),
             },
             conf: Value::Object(Default::default()),
@@ -2057,6 +2114,61 @@ mod tests {
             send_one_request(server, "GET /api/users HTTP/1.1\r\nHost: local\r\n\r\n").await;
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.ends_with("hello proxy"));
+        upstream_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_rewrite_replace_prefix_reaches_upstream() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut socket, _) = upstream_listener.accept().await.unwrap();
+            let request = read_test_http_message(&mut socket).await;
+            assert!(request.starts_with("GET /a.png?x=1 HTTP/1.1\r\n"));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let mut server = test_server();
+        server.upstreams.push(UpstreamConfig {
+            id: "up_rewrite".to_string(),
+            group: "api".to_string(),
+            name: "v1".to_string(),
+            host: format!("http://{}", upstream_addr),
+            priority: 0,
+            conf: Value::Object(Default::default()),
+        });
+        server.routes.push(RouteConfig {
+            id: "rt_proxy_rewrite".to_string(),
+            match_rule: RouteMatch {
+                r#type: 1,
+                path: "/123456789012345/".to_string(),
+            },
+            action: RouteAction {
+                r#type: "proxy".to_string(),
+                file: None,
+                proxy: Some(ProxyAction {
+                    upstream: "api".to_string(),
+                    websocket: WebSocketConfig { enabled: true },
+                    rewrite: Some(ProxyRewrite {
+                        r#type: "replacePrefix".to_string(),
+                        from: "/123456789012345/".to_string(),
+                        to: "/".to_string(),
+                    }),
+                }),
+            },
+            conf: Value::Object(Default::default()),
+        });
+
+        let response = send_one_request(
+            server,
+            "GET /123456789012345/a.png?x=1 HTTP/1.1\r\nHost: local\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.ends_with("ok"));
         upstream_task.await.unwrap();
     }
 
@@ -2105,6 +2217,7 @@ mod tests {
                 proxy: Some(ProxyAction {
                     upstream: "api".to_string(),
                     websocket: WebSocketConfig { enabled: true },
+                    rewrite: None,
                 }),
             },
             conf: Value::Object(Default::default()),
@@ -2154,6 +2267,7 @@ mod tests {
                 proxy: Some(ProxyAction {
                     upstream: "api".to_string(),
                     websocket: WebSocketConfig { enabled: true },
+                    rewrite: None,
                 }),
             },
             conf: Value::Object(Default::default()),
@@ -2248,6 +2362,7 @@ mod tests {
                 proxy: Some(ProxyAction {
                     upstream: "api".to_string(),
                     websocket: WebSocketConfig { enabled: true },
+                    rewrite: None,
                 }),
             },
             conf: Value::Object(Default::default()),
@@ -2348,6 +2463,7 @@ mod tests {
                 proxy: Some(ProxyAction {
                     upstream: "api".to_string(),
                     websocket: WebSocketConfig { enabled: true },
+                    rewrite: None,
                 }),
             },
             conf: Value::Object(Default::default()),
@@ -2417,6 +2533,7 @@ mod tests {
                 proxy: Some(ProxyAction {
                     upstream: "api".to_string(),
                     websocket: WebSocketConfig { enabled: true },
+                    rewrite: None,
                 }),
             },
             conf: Value::Object(Default::default()),
@@ -2536,6 +2653,7 @@ mod tests {
                 proxy: Some(ProxyAction {
                     upstream: "api".to_string(),
                     websocket: WebSocketConfig { enabled: true },
+                    rewrite: None,
                 }),
             },
             conf: Value::Object(Default::default()),
@@ -2785,6 +2903,7 @@ mod tests {
                 proxy: Some(ProxyAction {
                     upstream: "api".to_string(),
                     websocket: WebSocketConfig { enabled: true },
+                    rewrite: None,
                 }),
             },
             conf: Value::Object(Default::default()),
@@ -2851,6 +2970,7 @@ mod tests {
                 proxy: Some(ProxyAction {
                     upstream: "api".to_string(),
                     websocket: WebSocketConfig { enabled: true },
+                    rewrite: None,
                 }),
             },
             conf: Value::Object(Default::default()),

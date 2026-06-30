@@ -8,7 +8,8 @@ use uuid::Uuid;
 use crate::error::ApiError;
 use crate::model::{
     CreateHttpServerRequest, CreateRouteRequest, CreateUpstreamRequest, HttpServerConfig,
-    HttpServerFile, RouteConfig, SetEnabledRequest, UpdateHttpServerRequest, UpstreamConfig,
+    HttpServerFile, ProxyRewrite, RouteConfig, SetEnabledRequest, UpdateHttpServerRequest,
+    UpstreamConfig,
 };
 
 pub struct HttpServerStorage {
@@ -334,7 +335,13 @@ fn validate_route_config(route: &RouteConfig) -> Result<(), ApiError> {
         "file" => Err(ApiError::invalid_request(
             "action.file is required when action.type is file",
         )),
-        "proxy" if route.action.proxy.is_some() => Ok(()),
+        "proxy" if route.action.proxy.is_some() => validate_proxy_rewrite(
+            route
+                .action
+                .proxy
+                .as_ref()
+                .and_then(|proxy| proxy.rewrite.as_ref()),
+        ),
         "proxy" => Err(ApiError::invalid_request(
             "action.proxy is required when action.type is proxy",
         )),
@@ -366,17 +373,44 @@ fn validate_route(request: &CreateRouteRequest) -> Result<(), ApiError> {
             }
         }
         "proxy" => {
-            if request.action.proxy.is_none() {
+            let Some(proxy) = request.action.proxy.as_ref() else {
                 return Err(ApiError::invalid_request(
                     "action.proxy is required when action.type is proxy",
                 ));
-            }
+            };
+            validate_proxy_rewrite(proxy.rewrite.as_ref())?;
         }
         _ => {
             return Err(ApiError::invalid_request(
                 "action.type only supports file and proxy",
             ));
         }
+    }
+
+    Ok(())
+}
+
+fn validate_proxy_rewrite(rewrite: Option<&ProxyRewrite>) -> Result<(), ApiError> {
+    let Some(rewrite) = rewrite else {
+        return Ok(());
+    };
+
+    if rewrite.r#type != "replacePrefix" {
+        return Err(ApiError::invalid_request(
+            "action.proxy.rewrite.type only supports replacePrefix",
+        ));
+    }
+
+    if rewrite.from.is_empty() || !rewrite.from.starts_with('/') {
+        return Err(ApiError::invalid_request(
+            "action.proxy.rewrite.from must start with /",
+        ));
+    }
+
+    if rewrite.to.is_empty() || !rewrite.to.starts_with('/') {
+        return Err(ApiError::invalid_request(
+            "action.proxy.rewrite.to must start with /",
+        ));
     }
 
     Ok(())

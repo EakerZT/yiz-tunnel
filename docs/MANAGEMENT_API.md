@@ -421,12 +421,39 @@ Content-Type: application/json
       "upstream": "api",
       "websocket": {
         "enabled": true
+      },
+      "rewrite": {
+        "type": "replacePrefix",
+        "from": "/api/",
+        "to": "/"
       }
     }
   },
   "conf": {}
 }
 ```
+
+`action.proxy.rewrite` 为可选字段。当前仅支持：
+
+```json
+{
+  "type": "replacePrefix",
+  "from": "/123456789012345/",
+  "to": "/"
+}
+```
+
+含义是转发前把 path 的指定前缀替换掉，query string 保持不变。例如：
+
+```text
+/123456789012345/a.png?x=1 -> /a.png?x=1
+```
+
+说明：
+
+- rewrite 只影响发送给 upstream 的请求 path，不影响 route 匹配。
+- `from` 和 `to` 必须以 `/` 开头。
+- 未来可扩展类型可以考虑 `replaceFull`、`stripPrefix`、`addPrefix`、`regexReplace`，但当前传入这些类型会返回 `400`。
 
 #### 新增 file route
 

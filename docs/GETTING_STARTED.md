@@ -150,6 +150,22 @@ curl.exe -X POST http://127.0.0.1:9000/api/v1/http-server/{serverId}/routes `
 curl.exe http://127.0.0.1:18080/api/health
 ```
 
+如果希望把外部路径前缀去掉后再转发，例如：
+
+```text
+http://127.0.0.1:18080/123456789012345/a.png -> http://127.0.0.1:3000/a.png
+```
+
+可以创建带 `rewrite` 的 proxy route：
+
+```powershell
+curl.exe -X POST http://127.0.0.1:9000/api/v1/http-server/{serverId}/routes `
+  -H "Content-Type: application/json" `
+  -d "{\"match\":{\"type\":1,\"path\":\"/123456789012345/\"},\"action\":{\"type\":\"proxy\",\"proxy\":{\"upstream\":\"api\",\"websocket\":{\"enabled\":true},\"rewrite\":{\"type\":\"replacePrefix\",\"from\":\"/123456789012345/\",\"to\":\"/\"}}},\"conf\":{}}"
+```
+
+当前只实现 `replacePrefix`。rewrite 只修改转发给 upstream 的 path，query string 会保留。
+
 ## 蓝绿替换 upstream
 
 新增同 `group + name` 的 upstream 会触发替换。
