@@ -2,31 +2,116 @@
 
 [English](README.md)
 
-`yiz-tunnel` 是一个使用 Rust 实现的 HTTP tunnel / reverse proxy 项目，目标是先完成 nginx 常用 HTTP 能力的一个简单可用子集。
+`yiz-tunnel` 是一个使用 Rust 实现的 HTTP tunnel / reverse proxy 项目。它的目标是提供一个轻量、通过 API 管理的网关，用于本地服务代理、静态文件服务、upstream 路由和运行时配置变更。
 
-当前第一版聚焦 HTTP：
+项目使用 JSON 配置和管理 API，而不是 nginx 风格的文本配置语言。系统配置文件负责定义数据目录、日志目录和管理 API 监听地址；HTTP 服务规则通过管理 API 创建和更新。
 
-- HTTP/1.1 静态文件服务。
-- HTTP reverse proxy。
-- WebSocket proxy。
-- 管理 API。
-- JSON 配置持久化。
-- 日志输出。
-- HTTP 服务热更新。
-- upstream 轮询、失败切换和蓝绿替换状态。
+## 项目用途
 
-第一版暂不包含：
+`yiz-tunnel` 可以运行一个或多个 HTTP 服务，每个 HTTP 服务可以拥有自己的监听地址、upstream 分组、route 和运行状态。
 
-- HTTPS / HTTP/2 / HTTP/3。
-- 管理 API 鉴权。
-- `tcp-forward`。
+典型用途包括：
+
+- 从本地目录提供静态文件服务。
+- 将 HTTP 请求转发到本地或远程 upstream 服务。
+- 转发 WebSocket upgrade 连接。
+- 通过管理 API 管理 HTTP 服务、route 和 upstream 配置。
+- 替换 upstream 目标，同时允许旧请求自然结束。
+- 输出管理日志、访问日志和错误日志。
+
+## 已实现功能
+
+### 配置
+
+- 支持通过 `-c <path>` 指定系统配置文件。
+- 系统配置文件不存在时自动生成默认 `yiz-tunnel.json`。
+- 系统配置支持数据目录、日志目录和管理 API 监听地址。
+- HTTP 规则独立持久化到配置的数据目录下。
+- HTTP 规则事务式写入。
+- 启动时校验已持久化配置。
+
+### 管理 API
+
+- 版本化 API 前缀：`/api/v1`。
+- 统一响应结构：`{ "code": number, "message": string, "data": ... }`。
+- 系统状态接口。
+- HTTP 服务新增、列表、查看、更新、启停、删除、reload 和运行状态接口。
+- upstream 新增、列表、查看和删除接口。
+- route 新增、列表、查看和删除接口。
+- 支持 `conf` 字段和 route action 结构校验。
+
+### HTTP 运行时
+
+- 当前能力范围内的 HTTP/1.1 请求解析。
+- 多 HTTP 服务运行时。
+- 单个 HTTP 服务的运行时应用和 reload。
+- 服务状态：`starting`、`running`、`stopping`、`stopped`、`failed`。
+- keep-alive 处理。
+- 参考 nginx 常用配置项的请求大小和超时配置。
+
+### 静态文件
+
+- full 和 prefix route 匹配。
+- `root` 和 `alias` 风格文件路径行为。
+- 路径穿越防护。
+- 基础 MIME 判断。
+- `ETag`。
+- `Last-Modified`。
+- `If-None-Match`。
+- `If-Modified-Since`。
+- 单段字节 `Range` 请求。
+
+### 反向代理
+
+- 转发到 `http://` upstream。
+- WebSocket upgrade 转发。
+- proxy header：`Host`、`X-Real-IP`、`X-Forwarded-For`、`X-Forwarded-Proto`。
+- upstream 响应流式转发。
+- `Content-Length` 请求体流式转发。
+- chunked 请求体解码后转发。
+- upstream 连接、发送和读取超时。
+- upstream 连接失败后尝试后续候选。
+- 支持 `replacePrefix` path rewrite。
+
+### Upstream 路由
+
+- route 通过 upstream group 选择目标。
+- 按 priority 选择 upstream。
+- 相同 priority 的 upstream 轮询。
+- 新增相同 `group + name` 触发蓝绿替换。
+- 旧 upstream 仍有活动请求时状态为 `deading`。
+- 旧 upstream 活动请求归零后状态为 `dead`。
+
+### 日志
+
+- 管理日志。
+- 访问日志。
+- 错误日志。
+- JSON Lines 日志格式。
+
+### 测试和脚本
+
+- 单元测试覆盖 route 匹配、静态文件、proxy、keep-alive、range/cache、chunked 请求体、upstream 替换、graceful stop 和配置校验。
+- 管理 API 端到端冒烟测试脚本。
+
+## 未实现功能
+
+- TLS / HTTPS。
+- HTTP/2。
+- HTTP/3。
+- TCP 转发。
+- 管理 API 鉴权和授权。
 - 完整 nginx 配置语法兼容。
-
-## 文档
-
-- 快速开始：[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)
-- 管理 API：[docs/MANAGEMENT_API.md](docs/MANAGEMENT_API.md)
-- 设计和进度：[plans/PROJECT_CONTINUATION.md](plans/PROJECT_CONTINUATION.md)
+- regex route。
+- `replacePrefix` 之外的高级 rewrite 模式。
+- chunked 请求体直接流式转发到 upstream。
+- 静态文件 `index` 和 `try_files` 行为。
+- `serverName` 完整虚拟主机行为。
+- priority 和 round-robin 之外的负载均衡算法。
+- upstream 健康检查。
+- 请求/响应压缩。
+- 限流。
+- metrics 指标接口。
 
 ## 构建
 
@@ -40,9 +125,9 @@ cargo build
 target\debug\yiz-tunnel.exe
 ```
 
-## 启动
+## 运行
 
-指定系统配置文件：
+指定系统配置文件启动：
 
 ```powershell
 target\debug\yiz-tunnel.exe -c .\yiz-tunnel.json
@@ -50,7 +135,7 @@ target\debug\yiz-tunnel.exe -c .\yiz-tunnel.json
 
 不传 `-c` 时，默认使用当前目录下的 `yiz-tunnel.json`。
 
-如果配置文件不存在，程序会生成默认系统配置：
+如果配置文件不存在，程序会按默认值创建：
 
 ```json
 {
@@ -71,121 +156,42 @@ target\debug\yiz-tunnel.exe -c .\yiz-tunnel.json
 http://127.0.0.1:9000/api/v1
 ```
 
-查看状态：
+查看系统状态：
 
 ```powershell
 curl.exe http://127.0.0.1:9000/api/v1/system/status
 ```
 
-## 配置和数据
+## 文档
 
-系统配置文件只保存系统级配置，例如数据目录、日志目录和管理服务监听地址。
+- 快速开始：[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)
+- 管理 API：[中文](docs/MANAGEMENT_API.md) / [English](docs/MANAGEMENT_API.en.md)
+- 设计和进度记录：[plans/PROJECT_CONTINUATION.md](plans/PROJECT_CONTINUATION.md)
 
-HTTP 规则由管理 API 写入：
+## 验证
 
-```text
-data\http-server.json
-```
-
-日志文件：
-
-```text
-logs\admin.log
-logs\access.log
-logs\error.log
-```
-
-## 已支持能力
-
-### Static File
-
-- prefix / full route 匹配。
-- `root` / `alias` 风格文件路径。
-- 路径穿越防护。
-- 基础 MIME。
-- `ETag`。
-- `Last-Modified`。
-- 单段 `Range`。
-
-### Proxy
-
-- HTTP reverse proxy。
-- proxy path rewrite，当前支持 `replacePrefix`。
-- WebSocket upgrade 转发。
-- `Host`、`X-Real-IP`、`X-Forwarded-For`、`X-Forwarded-Proto`。
-- proxy 响应流式转发。
-- `Content-Length` 请求体流式转发。
-- chunked 请求体解码后转发。
-- upstream 连接失败后尝试后续候选。
-
-### Upstream
-
-- 按 `priority` 从小到大选择。
-- 同 `priority` 轮询。
-- 同 `group + name` 新增触发蓝绿替换。
-- 旧 upstream 有活动请求时保留为 `deading`。
-- 活动请求归零后变为 `dead`。
-
-### Runtime
-
-- HTTP 服务启停。
-- 停止时关闭 listener，不再接收新连接。
-- 有活动连接时状态为 `stopping`。
-- 活动连接归零后状态为 `stopped`。
-- 管理 API 修改配置后局部应用运行时配置。
-
-## 自动验证
-
-单元测试：
+运行单元测试：
 
 ```powershell
 cargo test
 ```
 
-当前测试覆盖：
-
-- route 匹配。
-- 静态文件响应。
-- proxy 转发。
-- WebSocket 基础转发路径。
-- proxy header。
-- proxy path rewrite。
-- keep-alive。
-- cache / range。
-- chunked 请求体。
-- `conf` 校验和运行时生效。
-- upstream 轮询、失败切换、蓝绿替换状态。
-- proxy 请求体和响应流式转发。
-- http-server graceful stop。
-
-管理 API 端到端冒烟测试：
+运行管理 API 冒烟测试：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-management-api.ps1
 ```
 
-冒烟脚本会启动独立临时实例，验证：
+## GitHub Actions
 
-- `system/status`。
-- 创建 HTTP 服务。
-- 创建静态文件 route。
-- 访问业务端口。
-- 同 `group + name` upstream 替换。
-- 非法 `conf` 返回 `400`。
+仓库包含：
 
-## 第一版限制
+- `.github/workflows/build.yml`：在 push 和 pull request 时运行格式检查、测试和 release 模式构建。
+- `.github/workflows/release.yml`：推送 `v0.1.0` 这类 tag 时，构建各平台产物并创建 GitHub Release。
 
-- 管理 API 暂无鉴权，只建议绑定本机或可信内网。
-- `serverName` 当前不是完整虚拟主机匹配能力。
-- chunked 请求体暂未流式转发。
-- 静态文件未实现 index / try_files。
-- 尚未实现 TLS。
-- 尚未实现 tcp-forward。
+创建 release：
 
-## 开发约定
-
-- 核心 HTTP runtime 尽量少引入外部依赖。
-- 管理 API 使用 `axum`。
-- 异步运行时使用 `tokio`。
-- JSON 使用 `serde_json`。
-- TLS 后续计划使用 `rustls`。
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```

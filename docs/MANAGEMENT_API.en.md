@@ -1,28 +1,28 @@
-# yiz-tunnel 管理 API 文档
+# yiz-tunnel Management API
 
-[English](MANAGEMENT_API.en.md)
+[中文版](MANAGEMENT_API.md)
 
-快速启动和完整调用示例见 [GETTING_STARTED.md](GETTING_STARTED.md)。
+For quick start and full command examples, see [GETTING_STARTED.md](GETTING_STARTED.md).
 
-## 基础信息
+## Basics
 
-默认管理服务地址：
+Default management service address:
 
 ```text
 http://127.0.0.1:9000
 ```
 
-API 版本前缀：
+API version prefix:
 
 ```text
 /api/v1
 ```
 
-第一阶段不考虑鉴权。
+Authentication is not implemented yet. Bind the management service to localhost or a trusted private network.
 
-## 通用响应
+## Response Shape
 
-所有接口统一返回：
+All endpoints return the same response envelope:
 
 ```json
 {
@@ -32,13 +32,13 @@ API 版本前缀：
 }
 ```
 
-字段说明：
+Fields:
 
-- `code`：数字状态码。成功为 `0`。
-- `message`：结果说明。成功为 `ok`。
-- `data`：业务数据。失败时通常为 `null`。
+- `code`: numeric result code. Success is `0`.
+- `message`: result message. Success is `ok`.
+- `data`: business payload. Failures usually return `null`.
 
-失败示例：
+Failure example:
 
 ```json
 {
@@ -50,13 +50,13 @@ API 版本前缀：
 
 ## System
 
-### 查看系统状态
+### Get System Status
 
 ```http
 GET /api/v1/system/status
 ```
 
-响应：
+Response:
 
 ```json
 {
@@ -78,13 +78,13 @@ GET /api/v1/system/status
 
 ## HTTP Server
 
-### 列举 HTTP 服务
+### List HTTP Servers
 
 ```http
 GET /api/v1/http-servers
 ```
 
-响应：
+Response:
 
 ```json
 {
@@ -94,37 +94,37 @@ GET /api/v1/http-servers
 }
 ```
 
-### 新增 HTTP 服务
+### Create HTTP Server
 
 ```http
 POST /api/v1/http-servers
 Content-Type: application/json
 ```
 
-请求体只接受：
+Accepted request fields:
 
 - `alias`
 - `listen`
 - `conf`
 - `graceful`
 
-`conf` 第一版支持以下字段，时间单位为毫秒，大小单位为字节。字段缺失时使用默认值；未知字段、非正整数或非对象结构会返回 `400`，且不会落盘。
+`conf` supports the following fields. Time values are in milliseconds. Size values are in bytes. Missing fields use defaults. Unknown fields, non-positive integers, or non-object `conf` values return `400` and are not persisted.
 
-| 字段 | 默认值 | 说明 |
+| Field | Default | Description |
 | --- | ---: | --- |
-| `client_max_body_size` | `1048576` | 请求体最大大小，超过后返回 `413` |
-| `client_header_timeout` | `60000` | 读取请求头超时 |
-| `client_body_timeout` | `60000` | 读取请求体超时 |
-| `send_timeout` | `60000` | 向客户端写响应超时 |
-| `keepalive_timeout` | `75000` | keep-alive 连接等待下一请求的超时 |
-| `keepalive_requests` | `1000` | 单连接最大请求数 |
-| `proxy_connect_timeout` | `60000` | 连接 upstream 超时 |
-| `proxy_send_timeout` | `60000` | 向 upstream 写请求超时 |
-| `proxy_read_timeout` | `60000` | 读取 upstream 响应超时 |
+| `client_max_body_size` | `1048576` | Maximum request body size. Exceeding it returns `413`. |
+| `client_header_timeout` | `60000` | Timeout for reading request headers. |
+| `client_body_timeout` | `60000` | Timeout for reading request bodies. |
+| `send_timeout` | `60000` | Timeout for writing responses to clients. |
+| `keepalive_timeout` | `75000` | Timeout for waiting for the next keep-alive request. |
+| `keepalive_requests` | `1000` | Maximum requests per connection. |
+| `proxy_connect_timeout` | `60000` | Timeout for connecting to upstream. |
+| `proxy_send_timeout` | `60000` | Timeout for writing requests to upstream. |
+| `proxy_read_timeout` | `60000` | Timeout for reading upstream responses. |
 
-请求读取阶段使用 `http-server.conf`；route/upstream 处理阶段支持 `route.conf` 和 `upstream.conf` 覆盖同名字段。
+Request reading uses `http-server.conf`. Route and upstream processing can override the same fields through `route.conf` and `upstream.conf`.
 
-请求示例：
+Request example:
 
 ```json
 {
@@ -144,7 +144,7 @@ Content-Type: application/json
 }
 ```
 
-响应示例：
+Response example:
 
 ```json
 {
@@ -172,29 +172,29 @@ Content-Type: application/json
 }
 ```
 
-### 查看 HTTP 服务配置
+### Get HTTP Server Configuration
 
 ```http
 GET /api/v1/http-server/{id}
 ```
 
-返回该 HTTP 服务的配置，不返回运行时状态。
+Returns the persisted HTTP server configuration, not runtime state.
 
-### 编辑 HTTP 服务
+### Update HTTP Server
 
 ```http
 PUT /api/v1/http-server/{id}
 Content-Type: application/json
 ```
 
-请求体只接受：
+Accepted request fields:
 
 - `alias`
 - `listen`
 - `conf`
 - `graceful`
 
-请求示例：
+Request example:
 
 ```json
 {
@@ -214,14 +214,14 @@ Content-Type: application/json
 }
 ```
 
-### 启停 HTTP 服务
+### Enable Or Disable HTTP Server
 
 ```http
 PUT /api/v1/http-server/{id}/enabled
 Content-Type: application/json
 ```
 
-请求体：
+Request body:
 
 ```json
 {
@@ -229,31 +229,31 @@ Content-Type: application/json
 }
 ```
 
-说明：
+Notes:
 
-- `enabled = true` 表示期望启用。
-- `enabled = false` 表示期望停用。
-- 删除 HTTP 服务前需要先设置 `enabled = false`。
+- `enabled = true` means the expected state is enabled.
+- `enabled = false` means the expected state is disabled.
+- An HTTP server must be disabled before it can be deleted.
 
-### 删除 HTTP 服务
+### Delete HTTP Server
 
 ```http
 DELETE /api/v1/http-server/{id}
 ```
 
-约束：
+Constraints:
 
-- 只有配置中的 `enabled = false` 时才允许删除。
-- 删除后新请求不再进入该服务。
-- 已有请求或连接由运行时自然结束。
+- Deletion is allowed only when persisted `enabled = false`.
+- New requests will no longer enter the deleted server.
+- Existing requests or connections finish naturally in runtime.
 
-### 查看 HTTP 服务状态
+### Get HTTP Server Runtime Info
 
 ```http
 GET /api/v1/http-server/{id}/info
 ```
 
-当前实现返回基础状态：
+Current response:
 
 ```json
 {
@@ -271,19 +271,19 @@ GET /api/v1/http-server/{id}/info
 }
 ```
 
-### 重新应用 HTTP 服务配置
+### Reload HTTP Server Configuration
 
 ```http
 POST /api/v1/http-server/{id}/reload
 ```
 
-说明：
+Notes:
 
-- 只重试当前已落盘配置。
-- 不修改配置文件。
-- 当前实现会重新应用实际 HTTP runtime。
+- Retries the currently persisted configuration.
+- Does not modify configuration files.
+- Re-applies the actual HTTP runtime.
 
-响应：
+Response:
 
 ```json
 {
@@ -298,28 +298,28 @@ POST /api/v1/http-server/{id}/reload
 
 ## Upstream
 
-### 列举 upstream
+### List Upstreams
 
 ```http
 GET /api/v1/http-server/{id}/upstreams
 ```
 
-### 新增 upstream
+### Create Upstream
 
 ```http
 POST /api/v1/http-server/{id}/upstreams
 Content-Type: application/json
 ```
 
-必填字段：
+Required fields:
 
 - `name`
 - `group`
 - `host`
 
-其它字段不传则使用默认值。
+Other fields use defaults when omitted.
 
-请求示例：
+Request example:
 
 ```json
 {
@@ -331,7 +331,7 @@ Content-Type: application/json
 }
 ```
 
-响应示例：
+Response example:
 
 ```json
 {
@@ -350,66 +350,66 @@ Content-Type: application/json
 }
 ```
 
-说明：
+Notes:
 
-- upstream 没有 `enabled` 字段。
-- 用户新增的 upstream 都表示期望启用。
-- 蓝绿发布通过新增同 `group` + 同 `name` upstream 触发。
-- 新增同 `group` + 同 `name` upstream 时，配置中只保留新 upstream；旧 upstream 如果仍有活动请求，会进入 `deading/dead` 运行时状态。
-- 列表和查看 upstream 会返回运行时字段：`status` 和 `activeRequestCount`。
-- 当前已配置 upstream 的 `status` 为 `running`。
-- 删除或被替换的旧 upstream 如果仍有活动请求，会继续出现在列表和查看接口中，`status` 为 `deading`。
-- 已删除旧 upstream 的活动请求归零后，`status` 会变为 `dead`。
+- Upstreams do not have an `enabled` field.
+- Created upstreams always represent expected enabled configuration.
+- Blue-green replacement is triggered by creating another upstream with the same `group + name`.
+- When creating the same `group + name`, only the new upstream remains in persisted configuration. The old upstream can remain visible as runtime state `deading/dead` if it still has active requests.
+- List and get endpoints include runtime fields: `status` and `activeRequestCount`.
+- Configured upstreams have `status = running`.
+- Deleted or replaced upstreams with active requests continue to appear as `deading`.
+- Once active requests drain to zero, deleted old upstreams become `dead`.
 
-### 查看 upstream
+### Get Upstream
 
 ```http
 GET /api/v1/http-server/{id}/upstream/{upstreamId}
 ```
 
-### 删除 upstream
+### Delete Upstream
 
 ```http
 DELETE /api/v1/http-server/{id}/upstream/{upstreamId}
 ```
 
-说明：
+Notes:
 
-- 删除 upstream 无额外状态要求。
-- 删除后新请求不再选择该 upstream。
-- 已经转发到该 upstream 的旧请求或旧连接继续自然结束。
-- 如果删除时该 upstream 仍有活动请求，可以继续通过 upstream 列表或查看接口观察 `deading/dead` 状态。
+- Deleting an upstream has no extra state requirement.
+- New requests no longer select the deleted upstream.
+- Existing requests or connections already forwarded to the upstream finish naturally.
+- If the upstream still has active requests, it can still be observed through upstream list/get endpoints as `deading/dead`.
 
 ## Route
 
-### 列举 route
+### List Routes
 
 ```http
 GET /api/v1/http-server/{id}/routes
 ```
 
-### 新增 route
+### Create Route
 
 ```http
 POST /api/v1/http-server/{id}/routes
 Content-Type: application/json
 ```
 
-必填字段：
+Required fields:
 
 - `match.type`
 - `match.path`
 - `action.type`
 
-当 `action.type = proxy` 时，必填：
+When `action.type = proxy`, required:
 
 - `action.proxy.upstream`
 
-当 `action.type = file` 时，必填：
+When `action.type = file`, required:
 
 - `action.file.dir`
 
-#### 新增 proxy route
+#### Create Proxy Route
 
 ```json
 {
@@ -435,7 +435,7 @@ Content-Type: application/json
 }
 ```
 
-`action.proxy.rewrite` 为可选字段。当前仅支持：
+`action.proxy.rewrite` is optional. Currently supported:
 
 ```json
 {
@@ -445,19 +445,19 @@ Content-Type: application/json
 }
 ```
 
-含义是转发前把 path 的指定前缀替换掉，query string 保持不变。例如：
+It replaces the configured path prefix before forwarding to upstream. Query string is preserved:
 
 ```text
 /123456789012345/a.png?x=1 -> /a.png?x=1
 ```
 
-说明：
+Notes:
 
-- rewrite 只影响发送给 upstream 的请求 path，不影响 route 匹配。
-- `from` 和 `to` 必须以 `/` 开头。
-- 未来可扩展类型可以考虑 `replaceFull`、`stripPrefix`、`addPrefix`、`regexReplace`，但当前传入这些类型会返回 `400`。
+- Rewrite only affects the request path sent to upstream. It does not affect route matching.
+- `from` and `to` must start with `/`.
+- Future types may include `replaceFull`, `stripPrefix`, `addPrefix`, and `regexReplace`, but currently these values return `400`.
 
-#### 新增 file route
+#### Create File Route
 
 ```json
 {
@@ -476,33 +476,33 @@ Content-Type: application/json
 }
 ```
 
-说明：
+Notes:
 
-- `match.type = 0` 表示 full 精确匹配。
-- `match.type = 1` 表示 prefix 前缀匹配。
-- 第一阶段不支持 `match.type = 2` regex。
-- 同一个 HTTP 服务下禁止创建相同 `match.type + match.path` 的 route。
-- route 顺序由系统维护。
+- `match.type = 0` means full exact match.
+- `match.type = 1` means prefix match.
+- `match.type = 2` regex is not implemented yet.
+- The same HTTP server cannot have duplicate `match.type + match.path` routes.
+- Route order is maintained by the system.
 
-### 查看 route
+### Get Route
 
 ```http
 GET /api/v1/http-server/{id}/route/{routeId}
 ```
 
-### 删除 route
+### Delete Route
 
 ```http
 DELETE /api/v1/http-server/{id}/route/{routeId}
 ```
 
-说明：
+Notes:
 
-- 删除 route 立即对新请求生效。
-- 已经进入处理流程的旧请求继续处理。
-- 不支持更新 route。
+- Deleting a route takes effect immediately for new requests.
+- Requests already in progress continue processing.
+- Updating routes is not supported.
 
-## 错误码
+## Error Codes
 
 ```text
 0     OK
@@ -548,15 +548,15 @@ DELETE /api/v1/http-server/{id}/route/{routeId}
 50002 TCP_FORWARD_BIND_FAILED
 ```
 
-## curl 示例
+## curl Examples
 
-### 查看系统状态
+### Get System Status
 
 ```bash
 curl http://127.0.0.1:9000/api/v1/system/status
 ```
 
-### 新增 HTTP 服务
+### Create HTTP Server
 
 ```bash
 curl -X POST http://127.0.0.1:9000/api/v1/http-servers \
@@ -576,7 +576,7 @@ curl -X POST http://127.0.0.1:9000/api/v1/http-servers \
   }'
 ```
 
-### 新增 upstream
+### Create Upstream
 
 ```bash
 curl -X POST http://127.0.0.1:9000/api/v1/http-server/{id}/upstreams \
@@ -588,7 +588,7 @@ curl -X POST http://127.0.0.1:9000/api/v1/http-server/{id}/upstreams \
   }'
 ```
 
-### 新增 proxy route
+### Create Proxy Route
 
 ```bash
 curl -X POST http://127.0.0.1:9000/api/v1/http-server/{id}/routes \

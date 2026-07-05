@@ -2,31 +2,116 @@
 
 [中文版](README.zh-CN.md)
 
-`yiz-tunnel` is a Rust HTTP tunnel / reverse proxy project. The first milestone is a small, practical subset of common nginx HTTP behavior.
+`yiz-tunnel` is a Rust-based HTTP tunnel and reverse proxy. It is designed to provide a lightweight, API-managed gateway for local services, static files, upstream routing, and runtime configuration changes.
 
-The first version focuses on HTTP:
+The project uses JSON configuration and a management API instead of an nginx-style text configuration language. The system configuration file defines where data and logs live, while HTTP server rules are created and updated through the management API.
 
-- HTTP/1.1 static file serving.
-- HTTP reverse proxy.
-- WebSocket proxy.
-- Management API.
-- JSON configuration persistence.
-- Log output.
-- HTTP server hot reload.
-- Upstream round-robin, failover, and blue-green replacement state.
+## What It Does
 
-The first version does not include:
+`yiz-tunnel` can run one or more HTTP servers, each with its own listen address, upstream groups, routes, and runtime state.
 
-- HTTPS / HTTP/2 / HTTP/3.
-- Management API authentication.
-- `tcp-forward`.
-- Full nginx configuration syntax compatibility.
+Typical use cases include:
 
-## Documentation
+- Serving static files from local directories.
+- Forwarding HTTP requests to local or remote upstream services.
+- Forwarding WebSocket upgrade connections.
+- Managing HTTP server, route, and upstream configuration through an API.
+- Replacing upstream targets while allowing existing requests to drain.
+- Keeping runtime logs for admin actions, access records, and errors.
 
-- Quick start: [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)
-- Management API: [docs/MANAGEMENT_API.md](docs/MANAGEMENT_API.md)
-- Design and progress: [plans/PROJECT_CONTINUATION.md](plans/PROJECT_CONTINUATION.md)
+## Implemented
+
+### Configuration
+
+- `-c <path>` support for specifying the system configuration file.
+- Default `yiz-tunnel.json` generation when the system configuration file does not exist.
+- System configuration for data directory, log directory, and management API listen address.
+- Separate persisted HTTP rule file under the configured data directory.
+- Transaction-style writes for persisted HTTP rules.
+- Startup validation for persisted configuration.
+
+### Management API
+
+- Versioned API prefix: `/api/v1`.
+- Unified response shape: `{ "code": number, "message": string, "data": ... }`.
+- System status endpoint.
+- HTTP server create, list, read, update, enable/disable, delete, reload, and runtime info endpoints.
+- Upstream create, list, read, and delete endpoints.
+- Route create, list, read, and delete endpoints.
+- Validation for supported `conf` fields and route action structures.
+
+### HTTP Runtime
+
+- HTTP/1.1 request parsing for the current supported feature set.
+- Multiple HTTP server runtimes.
+- Runtime apply/reload for a single HTTP server.
+- Server states: `starting`, `running`, `stopping`, `stopped`, `failed`.
+- Keep-alive handling.
+- Configurable request size and timeout fields inspired by common nginx options.
+
+### Static File
+
+- Full and prefix route matching.
+- `root` and `alias` style file path behavior.
+- Path traversal protection.
+- Basic MIME detection.
+- `ETag`.
+- `Last-Modified`.
+- `If-None-Match`.
+- `If-Modified-Since`.
+- Single byte `Range` requests.
+
+### Reverse Proxy
+
+- HTTP reverse proxy to `http://` upstreams.
+- WebSocket upgrade forwarding.
+- Proxy headers: `Host`, `X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`.
+- Streaming upstream responses.
+- Streaming `Content-Length` request bodies.
+- Decoding chunked request bodies before forwarding.
+- Upstream connect timeout, send timeout, and read timeout.
+- Fallback to later upstream candidates when connecting to an upstream fails.
+- Path rewrite with `replacePrefix`.
+
+### Upstream Routing
+
+- Upstream groups selected by route configuration.
+- Priority-based upstream selection.
+- Round-robin selection for upstreams with the same priority.
+- Blue-green style replacement by adding the same `group + name`.
+- Old upstream state tracking as `deading` while active requests are still using it.
+- Old upstream state changes to `dead` after active requests drain.
+
+### Logs
+
+- Admin log.
+- Access log.
+- Error log.
+- JSON Lines log format.
+
+### Tests And Scripts
+
+- Unit tests for route matching, static files, proxy behavior, keep-alive, range/cache behavior, chunked bodies, upstream replacement, graceful stop, and config validation.
+- End-to-end management API smoke test script.
+
+## Not Implemented
+
+- TLS / HTTPS.
+- HTTP/2.
+- HTTP/3.
+- TCP forwarding.
+- Management API authentication and authorization.
+- Complete nginx configuration syntax compatibility.
+- Regex routes.
+- Advanced rewrite modes beyond `replacePrefix`.
+- Streaming chunked request bodies directly to upstreams.
+- Static file `index` and `try_files` behavior.
+- Full virtual host behavior for `serverName`.
+- Load balancing algorithms beyond priority and round-robin.
+- Health checks for upstreams.
+- Request/response compression.
+- Rate limiting.
+- Metrics endpoint.
 
 ## Build
 
@@ -40,7 +125,7 @@ Build output:
 target\debug\yiz-tunnel.exe
 ```
 
-## Start
+## Run
 
 Start with an explicit system configuration file:
 
@@ -50,7 +135,7 @@ target\debug\yiz-tunnel.exe -c .\yiz-tunnel.json
 
 When `-c` is not provided, `yiz-tunnel` uses `yiz-tunnel.json` in the current directory.
 
-If the configuration file does not exist, the program creates it with default values:
+If the configuration file does not exist, it is created with default values:
 
 ```json
 {
@@ -77,115 +162,36 @@ Check system status:
 curl.exe http://127.0.0.1:9000/api/v1/system/status
 ```
 
-## Configuration And Data
+## Documentation
 
-The system configuration file only stores system-level settings, such as the data directory, log directory, and management service listen address.
+- Quick start: [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)
+- Management API: [English](docs/MANAGEMENT_API.en.md) / [中文](docs/MANAGEMENT_API.md)
+- Design and progress notes: [plans/PROJECT_CONTINUATION.md](plans/PROJECT_CONTINUATION.md)
 
-HTTP rules are written by the Management API:
+## Verification
 
-```text
-data\http-server.json
-```
-
-Log files:
-
-```text
-logs\admin.log
-logs\access.log
-logs\error.log
-```
-
-## Supported Features
-
-### Static File
-
-- Prefix / full route matching.
-- `root` / `alias` style file path resolution.
-- Path traversal protection.
-- Basic MIME detection.
-- `ETag`.
-- `Last-Modified`.
-- Single byte `Range`.
-
-### Proxy
-
-- HTTP reverse proxy.
-- Proxy path rewrite, currently supporting `replacePrefix`.
-- WebSocket upgrade forwarding.
-- `Host`, `X-Real-IP`, `X-Forwarded-For`, and `X-Forwarded-Proto`.
-- Streaming proxy responses.
-- Streaming `Content-Length` request bodies.
-- Decoding chunked request bodies before forwarding.
-- Trying later upstream candidates after upstream connection failure.
-
-### Upstream
-
-- Select by ascending `priority`.
-- Round-robin for upstreams with the same `priority`.
-- Adding the same `group + name` triggers blue-green replacement.
-- Old upstreams with active requests are retained as `deading`.
-- Old upstreams become `dead` after active requests drain to zero.
-
-### Runtime
-
-- Start and stop HTTP servers.
-- Stop closes the listener and stops accepting new connections.
-- Servers with active connections enter `stopping`.
-- Servers become `stopped` after active connections drain to zero.
-- Management API changes are applied locally to the affected runtime configuration.
-
-## Automated Verification
-
-Unit tests:
+Run unit tests:
 
 ```powershell
 cargo test
 ```
 
-Current test coverage:
-
-- Route matching.
-- Static file responses.
-- Proxy forwarding.
-- Basic WebSocket forwarding path.
-- Proxy headers.
-- Proxy path rewrite.
-- Keep-alive.
-- Cache / range.
-- Chunked request bodies.
-- `conf` validation and runtime behavior.
-- Upstream round-robin, failover, and blue-green replacement state.
-- Proxy request body and response streaming.
-- HTTP server graceful stop.
-
-Management API end-to-end smoke test:
+Run the management API smoke test:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-management-api.ps1
 ```
 
-The smoke script starts an isolated temporary instance and verifies:
+## GitHub Actions
 
-- `system/status`.
-- Creating an HTTP server.
-- Creating a static file route.
-- Accessing the runtime listen port.
-- Replacing an upstream with the same `group + name`.
-- Invalid `conf` returns `400`.
+The repository includes:
 
-## First Version Limits
+- `.github/workflows/build.yml`: runs formatting checks, tests, and release-mode builds on push and pull request.
+- `.github/workflows/release.yml`: builds platform artifacts and creates a GitHub Release when a tag such as `v0.1.0` is pushed.
 
-- The Management API currently has no authentication. Bind it to localhost or a trusted private network.
-- `serverName` is not a complete virtual host matching implementation yet.
-- Chunked request bodies are not streamed yet.
-- Static file serving does not implement index / try_files yet.
-- TLS is not implemented yet.
-- `tcp-forward` is not implemented yet.
+To create a release:
 
-## Development Notes
-
-- Keep the core HTTP runtime dependency-light.
-- The Management API uses `axum`.
-- The async runtime uses `tokio`.
-- JSON uses `serde_json`.
-- TLS is planned to use `rustls`.
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```

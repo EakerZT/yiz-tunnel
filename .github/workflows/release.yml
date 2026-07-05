@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build release artifact (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            package_name: yiz-tunnel-linux
+          - os: windows-latest
+            package_name: yiz-tunnel-windows
+          - os: macos-latest
+            package_name: yiz-tunnel-macos
+    runs-on: ${{ matrix.os }}
+    env:
+      PACKAGE_NAME: ${{ matrix.package_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+      - name: Package artifact
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/${PACKAGE_NAME}"
+          cp "target/release/yiz-tunnel" "dist/${PACKAGE_NAME}/"
+          cp "README.md" "dist/${PACKAGE_NAME}/"
+          cp "README.zh-CN.md" "dist/${PACKAGE_NAME}/"
+          tar -czf "${PACKAGE_NAME}.tar.gz" -C dist "${PACKAGE_NAME}"
+
+      - name: Package artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "dist/$env:PACKAGE_NAME" | Out-Null
+          Copy-Item "target/release/yiz-tunnel.exe" "dist/$env:PACKAGE_NAME/"
+          Copy-Item "README.md" "dist/$env:PACKAGE_NAME/"
+          Copy-Item "README.zh-CN.md" "dist/$env:PACKAGE_NAME/"
+          Compress-Archive -Path "dist/$env:PACKAGE_NAME" -DestinationPath "$env:PACKAGE_NAME.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE_NAME }}
+          path: |
+            *.tar.gz
+            *.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" artifacts/* --clobber
+          else
+            gh release create "$TAG_NAME" artifacts/* --title "$TAG_NAME" --generate-notes
+          fi
