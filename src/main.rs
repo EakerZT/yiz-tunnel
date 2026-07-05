@@ -1,6 +1,7 @@
 mod admin;
 mod config;
 mod error;
+mod hpack_huffman_table;
 mod logger;
 mod model;
 mod runtime;

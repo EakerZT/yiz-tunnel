@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use crate::error::ApiError;
+use crate::hpack_huffman_table::HPACK_HUFFMAN_CODES;
 use crate::logger::{AccessLogEntry, LogManager};
 use crate::model::{
     FileAction, HttpServerConfig, HttpServerInfo, ProxyAction, ProxyRewrite, RouteConfig,
@@ -64,6 +65,13 @@ struct AccessOutcome {
     response_time_ms: u128,
     upstream_id: Option<String>,
     upstream_name: Option<String>,
+}
+
+struct RuntimeResponse {
+    status: u16,
+    content_type: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
 }
 
 #[derive(Clone, Default)]
@@ -586,6 +594,14 @@ async fn handle_connection(
     remote_address: String,
     proxy_state: ProxyState,
 ) -> io::Result<Vec<AccessOutcome>> {
+    let first_conf = {
+        let server = config.read().await;
+        RuntimeConf::from_value(&server.conf)
+    };
+    if is_h2_prior_knowledge(&stream, first_conf.client_header_timeout).await? {
+        return handle_h2_connection(stream, config, remote_address, proxy_state).await;
+    }
+
     let mut outcomes = Vec::new();
     let mut handled = 0_usize;
 
@@ -751,6 +767,751 @@ async fn handle_connection(
     }
 
     Ok(outcomes)
+}
+
+const H2_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+const H2_FRAME_DATA: u8 = 0x0;
+const H2_FRAME_HEADERS: u8 = 0x1;
+const H2_FRAME_SETTINGS: u8 = 0x4;
+const H2_FRAME_PING: u8 = 0x6;
+const H2_FRAME_GOAWAY: u8 = 0x7;
+const H2_FRAME_CONTINUATION: u8 = 0x9;
+const H2_FLAG_ACK: u8 = 0x1;
+const H2_FLAG_END_STREAM: u8 = 0x1;
+const H2_FLAG_END_HEADERS: u8 = 0x4;
+const H2_FLAG_PADDED: u8 = 0x8;
+const H2_FLAG_PRIORITY: u8 = 0x20;
+const H2_DEFAULT_MAX_FRAME_SIZE: usize = 16_384;
+
+struct H2Frame {
+    frame_type: u8,
+    flags: u8,
+    stream_id: u32,
+    payload: Vec<u8>,
+}
+
+async fn is_h2_prior_knowledge(stream: &TcpStream, read_timeout: Duration) -> io::Result<bool> {
+    let started = std::time::Instant::now();
+    let mut buffer = [0_u8; 24];
+
+    loop {
+        let read = match timeout(read_timeout, stream.peek(&mut buffer)).await {
+            Ok(result) => result?,
+            Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "peek timed out")),
+        };
+        if read == 0 {
+            return Ok(false);
+        }
+        if read >= H2_PREFACE.len() {
+            return Ok(&buffer[..H2_PREFACE.len()] == H2_PREFACE);
+        }
+        if !H2_PREFACE.starts_with(&buffer[..read]) {
+            return Ok(false);
+        }
+        if started.elapsed() >= read_timeout {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+async fn handle_h2_connection(
+    mut stream: TcpStream,
+    config: Arc<RwLock<HttpServerConfig>>,
+    remote_address: String,
+    proxy_state: ProxyState,
+) -> io::Result<Vec<AccessOutcome>> {
+    let mut preface = [0_u8; 24];
+    stream.read_exact(&mut preface).await?;
+    if &preface != H2_PREFACE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid http/2 connection preface",
+        ));
+    }
+
+    write_h2_frame(&mut stream, H2_FRAME_SETTINGS, 0, 0, &[]).await?;
+    let mut outcomes = Vec::new();
+    let mut streams = HashMap::<u32, H2StreamState>::new();
+    let mut hpack = HpackDecoder::new();
+
+    while let Some(frame) = read_h2_frame(&mut stream).await? {
+        match frame.frame_type {
+            H2_FRAME_SETTINGS => {
+                if frame.flags & H2_FLAG_ACK == 0 {
+                    write_h2_frame(&mut stream, H2_FRAME_SETTINGS, H2_FLAG_ACK, 0, &[]).await?;
+                }
+            }
+            H2_FRAME_HEADERS => {
+                let mut header_block = h2_headers_payload(&frame)?;
+                if frame.flags & H2_FLAG_END_HEADERS == 0 {
+                    header_block.extend(read_h2_continuations(&mut stream, frame.stream_id).await?);
+                }
+                let headers = hpack.decode(&header_block)?;
+                let state = streams
+                    .entry(frame.stream_id)
+                    .or_insert_with(H2StreamState::default);
+                state.headers = headers;
+                if frame.flags & H2_FLAG_END_STREAM != 0 {
+                    let state = streams.remove(&frame.stream_id).unwrap_or_default();
+                    let outcome = handle_h2_request(
+                        &mut stream,
+                        frame.stream_id,
+                        state,
+                        Arc::clone(&config),
+                        remote_address.clone(),
+                        proxy_state.clone(),
+                    )
+                    .await?;
+                    outcomes.push(outcome);
+                }
+            }
+            H2_FRAME_DATA => {
+                let data = h2_data_payload(&frame)?;
+                let state = streams
+                    .entry(frame.stream_id)
+                    .or_insert_with(H2StreamState::default);
+                state.body.extend_from_slice(&data);
+                if frame.flags & H2_FLAG_END_STREAM != 0 {
+                    let state = streams.remove(&frame.stream_id).unwrap_or_default();
+                    let outcome = handle_h2_request(
+                        &mut stream,
+                        frame.stream_id,
+                        state,
+                        Arc::clone(&config),
+                        remote_address.clone(),
+                        proxy_state.clone(),
+                    )
+                    .await?;
+                    outcomes.push(outcome);
+                }
+            }
+            H2_FRAME_PING if frame.flags & H2_FLAG_ACK == 0 && frame.payload.len() == 8 => {
+                write_h2_frame(&mut stream, H2_FRAME_PING, H2_FLAG_ACK, 0, &frame.payload).await?;
+            }
+            H2_FRAME_GOAWAY => break,
+            _ => {}
+        }
+    }
+
+    Ok(outcomes)
+}
+
+#[derive(Default)]
+struct H2StreamState {
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+async fn handle_h2_request(
+    stream: &mut TcpStream,
+    stream_id: u32,
+    state: H2StreamState,
+    config: Arc<RwLock<HttpServerConfig>>,
+    remote_address: String,
+    proxy_state: ProxyState,
+) -> io::Result<AccessOutcome> {
+    let server = config.read().await.clone();
+    let server_conf = RuntimeConf::from_value(&server.conf);
+    let start = std::time::Instant::now();
+    let target = h2_header(&state.headers, ":path")
+        .unwrap_or("/")
+        .to_string();
+    let path = request_path(&target).to_string();
+    let method = h2_header(&state.headers, ":method")
+        .unwrap_or("GET")
+        .to_string();
+
+    let mut headers = state
+        .headers
+        .iter()
+        .filter(|(name, _)| !name.starts_with(':'))
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(authority) = h2_header(&state.headers, ":authority") {
+        headers.push(("host".to_string(), authority.to_string()));
+    }
+
+    if state.body.len() > server_conf.client_max_body_size {
+        let response =
+            simple_runtime_response(413, "Payload Too Large", b"payload too large", "text/plain");
+        send_h2_response(stream, stream_id, response).await?;
+        return Ok(AccessOutcome {
+            method,
+            path,
+            status: 413,
+            response_time_ms: start.elapsed().as_millis(),
+            upstream_id: None,
+            upstream_name: None,
+        });
+    }
+
+    let content_length = if state.body.is_empty() {
+        None
+    } else {
+        Some(state.body.len())
+    };
+    let request = HttpRequest {
+        method,
+        target,
+        version: "HTTP/2.0".to_string(),
+        headers,
+        body: state.body,
+        content_length,
+        body_complete: true,
+    };
+
+    let (response, upstream_id, upstream_name) =
+        build_h2_route_response(&server, &request, &path, &remote_address, &proxy_state).await?;
+    let status = response.status;
+    send_h2_response(stream, stream_id, response).await?;
+
+    Ok(outcome(
+        &request,
+        &path,
+        status,
+        start.elapsed().as_millis(),
+        upstream_id,
+        upstream_name,
+    ))
+}
+
+fn h2_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+async fn read_h2_frame(stream: &mut TcpStream) -> io::Result<Option<H2Frame>> {
+    let mut header = [0_u8; 9];
+    match stream.read_exact(&mut header).await {
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(err),
+    }
+
+    let length = ((header[0] as usize) << 16) | ((header[1] as usize) << 8) | header[2] as usize;
+    if length > 16 * 1024 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "http/2 frame too large",
+        ));
+    }
+    let mut payload = vec![0_u8; length];
+    stream.read_exact(&mut payload).await?;
+    let stream_id = u32::from_be_bytes([header[5], header[6], header[7], header[8]]) & 0x7fff_ffff;
+
+    Ok(Some(H2Frame {
+        frame_type: header[3],
+        flags: header[4],
+        stream_id,
+        payload,
+    }))
+}
+
+async fn write_h2_frame(
+    stream: &mut TcpStream,
+    frame_type: u8,
+    flags: u8,
+    stream_id: u32,
+    payload: &[u8],
+) -> io::Result<()> {
+    if payload.len() > 0x00ff_ffff {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "http/2 frame payload too large",
+        ));
+    }
+    let mut header = [0_u8; 9];
+    header[0] = ((payload.len() >> 16) & 0xff) as u8;
+    header[1] = ((payload.len() >> 8) & 0xff) as u8;
+    header[2] = (payload.len() & 0xff) as u8;
+    header[3] = frame_type;
+    header[4] = flags;
+    header[5..9].copy_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
+    stream.write_all(&header).await?;
+    stream.write_all(payload).await
+}
+
+fn h2_headers_payload(frame: &H2Frame) -> io::Result<Vec<u8>> {
+    let mut start = 0_usize;
+    let mut end = frame.payload.len();
+    if frame.flags & H2_FLAG_PADDED != 0 {
+        let Some(pad_len) = frame.payload.first().copied() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid padded headers frame",
+            ));
+        };
+        start += 1;
+        if pad_len as usize > end.saturating_sub(start) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid headers padding",
+            ));
+        }
+        end -= pad_len as usize;
+    }
+    if frame.flags & H2_FLAG_PRIORITY != 0 {
+        start += 5;
+    }
+    if start > end {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid headers payload",
+        ));
+    }
+    Ok(frame.payload[start..end].to_vec())
+}
+
+fn h2_data_payload(frame: &H2Frame) -> io::Result<Vec<u8>> {
+    let mut start = 0_usize;
+    let mut end = frame.payload.len();
+    if frame.flags & H2_FLAG_PADDED != 0 {
+        let Some(pad_len) = frame.payload.first().copied() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid padded data frame",
+            ));
+        };
+        start += 1;
+        if pad_len as usize > end.saturating_sub(start) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid data padding",
+            ));
+        }
+        end -= pad_len as usize;
+    }
+    Ok(frame.payload[start..end].to_vec())
+}
+
+async fn read_h2_continuations(stream: &mut TcpStream, stream_id: u32) -> io::Result<Vec<u8>> {
+    let mut result = Vec::new();
+    loop {
+        let Some(frame) = read_h2_frame(stream).await? else {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed during header block",
+            ));
+        };
+        if frame.frame_type != H2_FRAME_CONTINUATION || frame.stream_id != stream_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected http/2 continuation frame",
+            ));
+        }
+        result.extend_from_slice(&frame.payload);
+        if frame.flags & H2_FLAG_END_HEADERS != 0 {
+            break;
+        }
+    }
+    Ok(result)
+}
+
+struct HpackDecoder {
+    dynamic: VecDeque<(String, String)>,
+    dynamic_size: usize,
+    max_dynamic_size: usize,
+}
+
+impl HpackDecoder {
+    fn new() -> Self {
+        Self {
+            dynamic: VecDeque::new(),
+            dynamic_size: 0,
+            max_dynamic_size: 4096,
+        }
+    }
+
+    fn decode(&mut self, block: &[u8]) -> io::Result<Vec<(String, String)>> {
+        let mut headers = Vec::new();
+        let mut position = 0_usize;
+
+        while position < block.len() {
+            let byte = block[position];
+            if byte & 0x80 != 0 {
+                let index = hpack_decode_int(block, &mut position, 7)? as usize;
+                headers.push(self.entry(index)?);
+                continue;
+            }
+
+            if byte & 0xe0 == 0x20 {
+                let size = hpack_decode_int(block, &mut position, 5)? as usize;
+                self.update_size(size);
+                continue;
+            }
+
+            let indexed = byte & 0x40 != 0;
+            let prefix_bits = if indexed { 6 } else { 4 };
+            let name_index = hpack_decode_int(block, &mut position, prefix_bits)? as usize;
+            let name = if name_index == 0 {
+                hpack_decode_string(block, &mut position)?
+            } else {
+                self.entry(name_index)?.0
+            };
+            let value = hpack_decode_string(block, &mut position)?;
+            if indexed {
+                self.add(name.clone(), value.clone());
+            }
+            headers.push((name, value));
+        }
+
+        Ok(headers)
+    }
+
+    fn entry(&self, index: usize) -> io::Result<(String, String)> {
+        if let Some((name, value)) = hpack_static_entry(index) {
+            return Ok((name.to_string(), value.to_string()));
+        }
+
+        let dynamic_index = index
+            .checked_sub(62)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid hpack index"))?;
+        self.dynamic.get(dynamic_index).cloned().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid dynamic hpack index")
+        })
+    }
+
+    fn add(&mut self, name: String, value: String) {
+        let entry_size = name.len() + value.len() + 32;
+        if entry_size > self.max_dynamic_size {
+            self.dynamic.clear();
+            self.dynamic_size = 0;
+            return;
+        }
+
+        self.dynamic.push_front((name, value));
+        self.dynamic_size += entry_size;
+        self.evict();
+    }
+
+    fn update_size(&mut self, size: usize) {
+        self.max_dynamic_size = size;
+        self.evict();
+    }
+
+    fn evict(&mut self) {
+        while self.dynamic_size > self.max_dynamic_size {
+            let Some((name, value)) = self.dynamic.pop_back() else {
+                self.dynamic_size = 0;
+                break;
+            };
+            self.dynamic_size = self
+                .dynamic_size
+                .saturating_sub(name.len() + value.len() + 32);
+        }
+    }
+}
+
+#[cfg(test)]
+fn hpack_decode(block: &[u8]) -> io::Result<Vec<(String, String)>> {
+    HpackDecoder::new().decode(block)
+}
+
+fn hpack_decode_int(block: &[u8], position: &mut usize, prefix_bits: u8) -> io::Result<u32> {
+    if *position >= block.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "missing hpack integer",
+        ));
+    }
+    let mask = (1_u16 << prefix_bits) as u8 - 1;
+    let mut value = (block[*position] & mask) as u32;
+    *position += 1;
+    if value < mask as u32 {
+        return Ok(value);
+    }
+
+    let mut shift = 0_u32;
+    loop {
+        if *position >= block.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated hpack integer",
+            ));
+        }
+        let byte = block[*position];
+        *position += 1;
+        value = value.saturating_add(((byte & 0x7f) as u32) << shift);
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+        if shift > 28 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "hpack integer overflow",
+            ));
+        }
+    }
+    Ok(value)
+}
+
+fn hpack_decode_string(block: &[u8], position: &mut usize) -> io::Result<String> {
+    if *position >= block.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "missing hpack string",
+        ));
+    }
+    let huffman = block[*position] & 0x80 != 0;
+    let len = hpack_decode_int(block, position, 7)? as usize;
+    if (*position).saturating_add(len) > block.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated hpack string",
+        ));
+    }
+    let raw = &block[*position..*position + len];
+    *position += len;
+    let decoded = if huffman {
+        hpack_huffman_decode(raw)?
+    } else {
+        raw.to_vec()
+    };
+    String::from_utf8(decoded)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
+}
+
+fn hpack_huffman_decode(input: &[u8]) -> io::Result<Vec<u8>> {
+    let mut result = Vec::new();
+    let mut code = 0_u32;
+    let mut len = 0_u8;
+
+    for byte in input {
+        for bit_index in (0..8).rev() {
+            code = (code << 1) | (((byte >> bit_index) & 1) as u32);
+            len += 1;
+
+            if let Some(symbol) = hpack_huffman_symbol(code, len) {
+                result.push(symbol);
+                code = 0;
+                len = 0;
+                continue;
+            }
+
+            if len > 30 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid hpack huffman code",
+                ));
+            }
+        }
+    }
+
+    if len > 0 {
+        let padding = (1_u32 << len) - 1;
+        if len > 7 || code != padding {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid hpack huffman padding",
+            ));
+        }
+    }
+
+    Ok(result)
+}
+
+fn hpack_huffman_symbol(code: u32, len: u8) -> Option<u8> {
+    HPACK_HUFFMAN_CODES
+        .iter()
+        .position(|(candidate, candidate_len)| *candidate == code && *candidate_len == len)
+        .map(|index| index as u8)
+}
+
+fn hpack_encode_headers(headers: &[(String, String)]) -> Vec<u8> {
+    let mut result = Vec::new();
+    for (name, value) in headers {
+        let name = name.to_ascii_lowercase();
+        if let Some(index) = hpack_static_name_index(&name) {
+            hpack_encode_int(&mut result, 0, 4, index as u32);
+        } else {
+            hpack_encode_int(&mut result, 0, 4, 0);
+            hpack_encode_string(&mut result, &name);
+        }
+        hpack_encode_string(&mut result, value);
+    }
+    result
+}
+
+fn hpack_encode_int(out: &mut Vec<u8>, prefix: u8, prefix_bits: u8, value: u32) {
+    let max = (1_u32 << prefix_bits) - 1;
+    if value < max {
+        out.push(prefix | value as u8);
+        return;
+    }
+    out.push(prefix | max as u8);
+    let mut remaining = value - max;
+    while remaining >= 128 {
+        out.push((remaining as u8 & 0x7f) | 0x80);
+        remaining >>= 7;
+    }
+    out.push(remaining as u8);
+}
+
+fn hpack_encode_string(out: &mut Vec<u8>, value: &str) {
+    hpack_encode_int(out, 0, 7, value.len() as u32);
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn hpack_static_name_index(name: &str) -> Option<usize> {
+    (1..=61).find(|index| {
+        hpack_static_entry(*index)
+            .map(|(n, _)| n == name)
+            .unwrap_or(false)
+    })
+}
+
+fn hpack_static_entry(index: usize) -> Option<(&'static str, &'static str)> {
+    Some(match index {
+        1 => (":authority", ""),
+        2 => (":method", "GET"),
+        3 => (":method", "POST"),
+        4 => (":path", "/"),
+        5 => (":path", "/index.html"),
+        6 => (":scheme", "http"),
+        7 => (":scheme", "https"),
+        8 => (":status", "200"),
+        9 => (":status", "204"),
+        10 => (":status", "206"),
+        11 => (":status", "304"),
+        12 => (":status", "400"),
+        13 => (":status", "404"),
+        14 => (":status", "500"),
+        15 => ("accept-charset", ""),
+        16 => ("accept-encoding", "gzip, deflate"),
+        17 => ("accept-language", ""),
+        18 => ("accept-ranges", ""),
+        19 => ("accept", ""),
+        20 => ("access-control-allow-origin", ""),
+        21 => ("age", ""),
+        22 => ("allow", ""),
+        23 => ("authorization", ""),
+        24 => ("cache-control", ""),
+        25 => ("content-disposition", ""),
+        26 => ("content-encoding", ""),
+        27 => ("content-language", ""),
+        28 => ("content-length", ""),
+        29 => ("content-location", ""),
+        30 => ("content-range", ""),
+        31 => ("content-type", ""),
+        32 => ("cookie", ""),
+        33 => ("date", ""),
+        34 => ("etag", ""),
+        35 => ("expect", ""),
+        36 => ("expires", ""),
+        37 => ("from", ""),
+        38 => ("host", ""),
+        39 => ("if-match", ""),
+        40 => ("if-modified-since", ""),
+        41 => ("if-none-match", ""),
+        42 => ("if-range", ""),
+        43 => ("if-unmodified-since", ""),
+        44 => ("last-modified", ""),
+        45 => ("link", ""),
+        46 => ("location", ""),
+        47 => ("max-forwards", ""),
+        48 => ("proxy-authenticate", ""),
+        49 => ("proxy-authorization", ""),
+        50 => ("range", ""),
+        51 => ("referer", ""),
+        52 => ("refresh", ""),
+        53 => ("retry-after", ""),
+        54 => ("server", ""),
+        55 => ("set-cookie", ""),
+        56 => ("strict-transport-security", ""),
+        57 => ("transfer-encoding", ""),
+        58 => ("user-agent", ""),
+        59 => ("vary", ""),
+        60 => ("via", ""),
+        61 => ("www-authenticate", ""),
+        _ => return None,
+    })
+}
+
+async fn build_h2_route_response(
+    server: &HttpServerConfig,
+    request: &HttpRequest,
+    path: &str,
+    remote_address: &str,
+    proxy_state: &ProxyState,
+) -> io::Result<(RuntimeResponse, Option<String>, Option<String>)> {
+    let Some(route) = select_route(&server.routes, path) else {
+        return Ok((
+            simple_runtime_response(404, "Not Found", b"not found", "text/plain"),
+            None,
+            None,
+        ));
+    };
+
+    let route_conf = RuntimeConf::for_route(&server.conf, &route.conf);
+    match route.action.r#type.as_str() {
+        "file" => {
+            let Some(file) = &route.action.file else {
+                return Ok((
+                    simple_runtime_response(
+                        500,
+                        "Internal Server Error",
+                        b"file action missing",
+                        "text/plain",
+                    ),
+                    None,
+                    None,
+                ));
+            };
+            Ok((
+                build_file_response(route, file, path, request).await?,
+                None,
+                None,
+            ))
+        }
+        "proxy" => {
+            let Some(proxy) = &route.action.proxy else {
+                return Ok((
+                    simple_runtime_response(
+                        500,
+                        "Internal Server Error",
+                        b"proxy action missing",
+                        "text/plain",
+                    ),
+                    None,
+                    None,
+                ));
+            };
+            build_h2_proxy_response(
+                server,
+                proxy,
+                request,
+                remote_address,
+                &route_conf,
+                proxy_state,
+            )
+            .await
+        }
+        _ => Ok((
+            simple_runtime_response(
+                500,
+                "Internal Server Error",
+                b"unsupported action",
+                "text/plain",
+            ),
+            None,
+            None,
+        )),
+    }
+    .or_else(|err| {
+        if err.kind() == io::ErrorKind::TimedOut {
+            Ok((
+                simple_runtime_response(504, "Gateway Timeout", b"gateway timeout", "text/plain"),
+                None,
+                None,
+            ))
+        } else {
+            Err(err)
+        }
+    })
 }
 
 async fn read_http_request(
@@ -1217,6 +1978,133 @@ async fn serve_file(
     Ok(200)
 }
 
+async fn build_file_response(
+    route: &RouteConfig,
+    file: &FileAction,
+    path: &str,
+    request: &HttpRequest,
+) -> io::Result<RuntimeResponse> {
+    let Some(file_path) = resolve_file_path(route, file, path) else {
+        return Ok(simple_runtime_response(
+            403,
+            "Forbidden",
+            b"forbidden",
+            "text/plain",
+        ));
+    };
+
+    let metadata = match tokio::fs::metadata(&file_path).await {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(simple_runtime_response(
+                404,
+                "Not Found",
+                b"not found",
+                "text/plain",
+            ));
+        }
+        Err(_) => {
+            return Ok(simple_runtime_response(
+                403,
+                "Forbidden",
+                b"forbidden",
+                "text/plain",
+            ));
+        }
+    };
+
+    if metadata.is_dir() {
+        return Ok(simple_runtime_response(
+            403,
+            "Forbidden",
+            b"forbidden",
+            "text/plain",
+        ));
+    }
+
+    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let etag = file_etag(metadata.len(), modified);
+    let last_modified = httpdate::fmt_http_date(modified);
+
+    if request
+        .headers
+        .iter()
+        .any(|(name, value)| name.eq_ignore_ascii_case("if-none-match") && value.trim() == etag)
+    {
+        return Ok(runtime_response(
+            304,
+            b"",
+            "text/plain",
+            cache_headers(&etag, &last_modified),
+        ));
+    }
+
+    if request.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("if-modified-since")
+            && httpdate::parse_http_date(value)
+                .map(|since| modified <= since)
+                .unwrap_or(false)
+    }) {
+        return Ok(runtime_response(
+            304,
+            b"",
+            "text/plain",
+            cache_headers(&etag, &last_modified),
+        ));
+    }
+
+    let content = match tokio::fs::read(&file_path).await {
+        Ok(content) => content,
+        Err(_) => {
+            return Ok(simple_runtime_response(
+                403,
+                "Forbidden",
+                b"forbidden",
+                "text/plain",
+            ));
+        }
+    };
+
+    let mime = mime_type(&file_path);
+    if let Some(range_header) = request_header(request, "range") {
+        match parse_byte_range(range_header, content.len() as u64) {
+            Some((start, end)) => {
+                let content_range = format!("bytes {start}-{end}/{}", content.len());
+                let body = &content[start as usize..=end as usize];
+                let mut headers = cache_headers(&etag, &last_modified);
+                headers.push(("Content-Range".to_string(), content_range));
+                return Ok(runtime_response(206, body, mime, headers));
+            }
+            None => {
+                let content_range = format!("bytes */{}", content.len());
+                let mut headers = cache_headers(&etag, &last_modified);
+                headers.push(("Content-Range".to_string(), content_range));
+                return Ok(runtime_response(
+                    416,
+                    b"range not satisfiable",
+                    "text/plain",
+                    headers,
+                ));
+            }
+        }
+    }
+
+    Ok(runtime_response(
+        200,
+        &content,
+        mime,
+        cache_headers(&etag, &last_modified),
+    ))
+}
+
+fn cache_headers(etag: &str, last_modified: &str) -> Vec<(String, String)> {
+    vec![
+        ("ETag".to_string(), etag.to_string()),
+        ("Last-Modified".to_string(), last_modified.to_string()),
+        ("Accept-Ranges".to_string(), "bytes".to_string()),
+    ]
+}
+
 fn resolve_file_path(route: &RouteConfig, file: &FileAction, path: &str) -> Option<PathBuf> {
     let suffix = if file.alias == 1 {
         path.strip_prefix(&route.match_rule.path).unwrap_or(path)
@@ -1533,6 +2421,164 @@ async fn proxy_upstream_response(
     Ok(status)
 }
 
+async fn build_h2_proxy_response(
+    server: &HttpServerConfig,
+    proxy: &ProxyAction,
+    request: &HttpRequest,
+    remote_address: &str,
+    route_conf: &RuntimeConf,
+    proxy_state: &ProxyState,
+) -> io::Result<(RuntimeResponse, Option<String>, Option<String>)> {
+    let candidates =
+        select_upstream_candidates(&server.id, &proxy.upstream, &server.upstreams, proxy_state);
+    if candidates.is_empty() {
+        return Ok((
+            simple_runtime_response(502, "Bad Gateway", b"bad gateway", "text/plain"),
+            None,
+            None,
+        ));
+    }
+
+    let mut last_upstream_id = None;
+    let mut last_upstream_name = None;
+    let mut last_failure_was_timeout = false;
+    let mut connected = None;
+
+    for upstream in candidates {
+        last_upstream_id = Some(upstream.id.clone());
+        last_upstream_name = Some(upstream.name.clone());
+        let conf = route_conf.for_upstream(&upstream.conf);
+        let Some((host, port)) = parse_http_upstream(&upstream.host) else {
+            last_failure_was_timeout = false;
+            continue;
+        };
+
+        match timeout(
+            conf.proxy_connect_timeout,
+            TcpStream::connect(format!("{host}:{port}")),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => {
+                connected = Some((upstream, conf, host, stream));
+                break;
+            }
+            Ok(Err(_)) => {
+                last_failure_was_timeout = false;
+            }
+            Err(_) => {
+                last_failure_was_timeout = true;
+            }
+        }
+    }
+
+    let Some((upstream, conf, host, mut upstream_stream)) = connected else {
+        let response = if last_failure_was_timeout {
+            simple_runtime_response(504, "Gateway Timeout", b"gateway timeout", "text/plain")
+        } else {
+            simple_runtime_response(502, "Bad Gateway", b"bad gateway", "text/plain")
+        };
+        return Ok((response, last_upstream_id, last_upstream_name));
+    };
+
+    let upstream_id = Some(upstream.id.clone());
+    let upstream_name = Some(upstream.name.clone());
+    let _upstream_request_guard = proxy_state.increment_upstream_request(&upstream.id);
+    let request_bytes = build_proxy_request(
+        request,
+        &host,
+        remote_address,
+        false,
+        proxy.rewrite.as_ref(),
+    );
+    timed_write_all(
+        &mut upstream_stream,
+        &request_bytes,
+        conf.proxy_send_timeout,
+    )
+    .await?;
+
+    let response = match collect_proxy_upstream_response(&mut upstream_stream, &conf).await {
+        Ok(response) => response,
+        Err(err) if err.kind() == io::ErrorKind::TimedOut => {
+            simple_runtime_response(504, "Gateway Timeout", b"gateway timeout", "text/plain")
+        }
+        Err(_) => simple_runtime_response(502, "Bad Gateway", b"bad gateway", "text/plain"),
+    };
+
+    Ok((response, upstream_id, upstream_name))
+}
+
+async fn collect_proxy_upstream_response(
+    upstream: &mut TcpStream,
+    conf: &RuntimeConf,
+) -> io::Result<RuntimeResponse> {
+    let mut buffer = Vec::with_capacity(4096);
+    let header_end;
+
+    loop {
+        let mut chunk = [0_u8; 8192];
+        let read = timed_read(upstream, &mut chunk, conf.proxy_read_timeout).await?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "upstream closed before response headers",
+            ));
+        }
+
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(index) = find_header_end(&buffer) {
+            header_end = index;
+            break;
+        }
+
+        if buffer.len() > 64 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "upstream response headers too large",
+            ));
+        }
+    }
+
+    let status = status_from_response(&buffer).unwrap_or(200);
+    let headers_raw = String::from_utf8_lossy(&buffer[..header_end]);
+    let mut content_type = "application/octet-stream".to_string();
+    let mut headers = Vec::new();
+    for line in headers_raw.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("content-type") {
+            content_type = value.to_string();
+            continue;
+        }
+        if is_h2_filtered_header(name) || name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        headers.push((name.to_string(), value.to_string()));
+    }
+
+    let mut body = buffer[header_end + 4..].to_vec();
+    loop {
+        let mut chunk = [0_u8; 8192];
+        match timed_read(upstream, &mut chunk, conf.proxy_read_timeout).await {
+            Ok(0) => break,
+            Ok(read) => body.extend_from_slice(&chunk[..read]),
+            Err(err) if err.kind() == io::ErrorKind::TimedOut => break,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(RuntimeResponse {
+        status,
+        content_type,
+        headers,
+        body,
+    })
+}
+
 fn parse_http_upstream(value: &str) -> Option<(String, u16)> {
     let rest = value.strip_prefix("http://")?;
     let authority = rest.split('/').next().unwrap_or(rest);
@@ -1666,8 +2712,13 @@ fn build_proxy_request(
 ) -> Vec<u8> {
     let mut result = Vec::new();
     let target = proxy_target(request, rewrite);
+    let upstream_version = if request.version.eq_ignore_ascii_case("HTTP/2.0") {
+        "HTTP/1.1"
+    } else {
+        request.version.as_str()
+    };
     result.extend_from_slice(
-        format!("{} {} {}\r\n", request.method, target, request.version).as_bytes(),
+        format!("{} {} {}\r\n", request.method, target, upstream_version).as_bytes(),
     );
 
     let mut wrote_host = false;
@@ -1755,6 +2806,91 @@ fn rewrite_proxy_path(path: &str, rewrite: Option<&ProxyRewrite>) -> Option<Stri
     }
 
     Some(format!("{}{}", rewrite.to, &path[rewrite.from.len()..]))
+}
+
+fn simple_runtime_response(
+    status: u16,
+    _reason: &'static str,
+    body: &[u8],
+    content_type: &str,
+) -> RuntimeResponse {
+    runtime_response(status, body, content_type, Vec::new())
+}
+
+fn runtime_response(
+    status: u16,
+    body: &[u8],
+    content_type: &str,
+    headers: Vec<(String, String)>,
+) -> RuntimeResponse {
+    RuntimeResponse {
+        status,
+        content_type: content_type.to_string(),
+        headers,
+        body: body.to_vec(),
+    }
+}
+
+async fn send_h2_response(
+    stream: &mut TcpStream,
+    stream_id: u32,
+    response: RuntimeResponse,
+) -> io::Result<()> {
+    let mut headers = vec![
+        (":status".to_string(), response.status.to_string()),
+        ("content-type".to_string(), response.content_type),
+        (
+            "content-length".to_string(),
+            response.body.len().to_string(),
+        ),
+    ];
+    for (name, value) in &response.headers {
+        if is_h2_filtered_header(name) || name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        headers.push((name.to_ascii_lowercase(), value.clone()));
+    }
+
+    let header_block = hpack_encode_headers(&headers);
+    let header_flags = if response.body.is_empty() {
+        H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM
+    } else {
+        H2_FLAG_END_HEADERS
+    };
+    write_h2_frame(
+        stream,
+        H2_FRAME_HEADERS,
+        header_flags,
+        stream_id,
+        &header_block,
+    )
+    .await?;
+
+    if !response.body.is_empty() {
+        let mut remaining = response.body.as_slice();
+        while remaining.len() > H2_DEFAULT_MAX_FRAME_SIZE {
+            let (chunk, rest) = remaining.split_at(H2_DEFAULT_MAX_FRAME_SIZE);
+            write_h2_frame(stream, H2_FRAME_DATA, 0, stream_id, chunk).await?;
+            remaining = rest;
+        }
+        write_h2_frame(
+            stream,
+            H2_FRAME_DATA,
+            H2_FLAG_END_STREAM,
+            stream_id,
+            remaining,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn is_h2_filtered_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("proxy-connection")
+        || name.eq_ignore_ascii_case("upgrade")
 }
 
 async fn write_simple_response(
@@ -2170,6 +3306,125 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.ends_with("ok"));
         upstream_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn h2_static_file_request_returns_file_content() {
+        let dir = std::env::temp_dir().join(format!("yiz-tunnel-h2-{}", Uuid::now_v7().simple()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("hello.txt"), b"hello h2")
+            .await
+            .unwrap();
+
+        let mut server = test_server();
+        server.routes.push(RouteConfig {
+            id: "rt_static".to_string(),
+            match_rule: RouteMatch {
+                r#type: 1,
+                path: "/".to_string(),
+            },
+            action: RouteAction {
+                r#type: "file".to_string(),
+                file: Some(FileAction {
+                    dir: dir.display().to_string(),
+                    alias: 0,
+                }),
+                proxy: None,
+            },
+            conf: Value::Object(Default::default()),
+        });
+
+        let (status, body) = send_h2_request(server, "/hello.txt").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, "hello h2");
+
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
+    async fn h2_proxy_request_forwards_to_upstream_with_rewrite() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut socket, _) = upstream_listener.accept().await.unwrap();
+            let request = read_test_http_message(&mut socket).await;
+            assert!(request.starts_with("GET /a.png?x=1 HTTP/1.1\r\n"));
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nh2 proxy",
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut server = test_server();
+        server.upstreams.push(UpstreamConfig {
+            id: "up_h2".to_string(),
+            group: "api".to_string(),
+            name: "v1".to_string(),
+            host: format!("http://{}", upstream_addr),
+            priority: 0,
+            conf: Value::Object(Default::default()),
+        });
+        server.routes.push(RouteConfig {
+            id: "rt_h2_proxy".to_string(),
+            match_rule: RouteMatch {
+                r#type: 1,
+                path: "/123456789012345/".to_string(),
+            },
+            action: RouteAction {
+                r#type: "proxy".to_string(),
+                file: None,
+                proxy: Some(ProxyAction {
+                    upstream: "api".to_string(),
+                    websocket: WebSocketConfig { enabled: true },
+                    rewrite: Some(ProxyRewrite {
+                        r#type: "replacePrefix".to_string(),
+                        from: "/123456789012345/".to_string(),
+                        to: "/".to_string(),
+                    }),
+                }),
+            },
+            conf: Value::Object(Default::default()),
+        });
+
+        let (status, body) = send_h2_request(server, "/123456789012345/a.png?x=1").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, "h2 proxy");
+        upstream_task.await.unwrap();
+    }
+
+    #[test]
+    fn hpack_decodes_huffman_string() {
+        let mut position = 0_usize;
+        let encoded = [
+            0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
+        ];
+
+        let decoded = hpack_decode_string(&encoded, &mut position).unwrap();
+
+        assert_eq!(decoded, "www.example.com");
+        assert_eq!(position, encoded.len());
+    }
+
+    #[test]
+    fn hpack_dynamic_table_indexes_incremental_headers() {
+        let mut block = Vec::new();
+        block.push(0x40);
+        hpack_encode_string(&mut block, "x-test");
+        hpack_encode_string(&mut block, "one");
+        hpack_encode_int(&mut block, 0x80, 7, 62);
+
+        let mut decoder = HpackDecoder::new();
+        let headers = decoder.decode(&block).unwrap();
+
+        assert_eq!(
+            headers,
+            vec![
+                ("x-test".to_string(), "one".to_string()),
+                ("x-test".to_string(), "one".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -3037,6 +4292,80 @@ mod tests {
 
     async fn send_one_request(server: HttpServerConfig, request: &str) -> String {
         send_one_request_with_state(server, request, ProxyState::default()).await
+    }
+
+    async fn send_h2_request(server: HttpServerConfig, uri: &str) -> (u16, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let config = Arc::new(RwLock::new(server));
+
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection(
+                stream,
+                config,
+                "127.0.0.1:50010".to_string(),
+                ProxyState::default(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(H2_PREFACE).await.unwrap();
+        write_h2_frame(&mut stream, H2_FRAME_SETTINGS, 0, 0, &[])
+            .await
+            .unwrap();
+
+        let headers = vec![
+            (":method".to_string(), "GET".to_string()),
+            (":scheme".to_string(), "http".to_string()),
+            (":authority".to_string(), "localhost".to_string()),
+            (":path".to_string(), uri.to_string()),
+        ];
+        let header_block = hpack_encode_headers(&headers);
+        write_h2_frame(
+            &mut stream,
+            H2_FRAME_HEADERS,
+            H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
+            1,
+            &header_block,
+        )
+        .await
+        .unwrap();
+
+        let mut status = 0_u16;
+        let mut body = Vec::new();
+        loop {
+            let frame = read_h2_frame(&mut stream).await.unwrap().unwrap();
+            match frame.frame_type {
+                H2_FRAME_SETTINGS => {
+                    if frame.flags & H2_FLAG_ACK == 0 {
+                        write_h2_frame(&mut stream, H2_FRAME_SETTINGS, H2_FLAG_ACK, 0, &[])
+                            .await
+                            .unwrap();
+                    }
+                }
+                H2_FRAME_HEADERS => {
+                    let headers = hpack_decode(&h2_headers_payload(&frame).unwrap()).unwrap();
+                    status = h2_header(&headers, ":status").unwrap().parse().unwrap();
+                    if frame.flags & H2_FLAG_END_STREAM != 0 {
+                        break;
+                    }
+                }
+                H2_FRAME_DATA => {
+                    body.extend_from_slice(&h2_data_payload(&frame).unwrap());
+                    if frame.flags & H2_FLAG_END_STREAM != 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        drop(stream);
+        server_task.await.unwrap();
+        (status, String::from_utf8(body).unwrap())
     }
 
     async fn send_one_request_with_state(

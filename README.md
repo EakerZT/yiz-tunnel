@@ -43,6 +43,9 @@ Typical use cases include:
 ### HTTP Runtime
 
 - HTTP/1.1 request parsing for the current supported feature set.
+- Self-implemented HTTP/2 cleartext prior-knowledge support for inbound client connections.
+- Minimal HTTP/2 frame handling for SETTINGS, HEADERS, DATA, PING, CONTINUATION, and GOAWAY.
+- Basic HPACK support, including static table lookup, dynamic table indexing, and Huffman decoding.
 - Multiple HTTP server runtimes.
 - Runtime apply/reload for a single HTTP server.
 - Server states: `starting`, `running`, `stopping`, `stopped`, `failed`.
@@ -64,6 +67,7 @@ Typical use cases include:
 ### Reverse Proxy
 
 - HTTP reverse proxy to `http://` upstreams.
+- HTTP/2 inbound requests can be proxied to HTTP/1.1 upstreams.
 - WebSocket upgrade forwarding.
 - Proxy headers: `Host`, `X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`.
 - Streaming upstream responses.
@@ -97,7 +101,9 @@ Typical use cases include:
 ## Not Implemented
 
 - TLS / HTTPS.
-- HTTP/2.
+- HTTP/2 over TLS with ALPN.
+- HTTP/1.1 `Upgrade: h2c`.
+- Complete HTTP/2 stream state machine, flow control, priority, and reset handling.
 - HTTP/3.
 - TCP forwarding.
 - Management API authentication and authorization.
@@ -166,6 +172,7 @@ curl.exe http://127.0.0.1:9000/api/v1/system/status
 
 - Quick start: [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)
 - Management API: [English](docs/MANAGEMENT_API.en.md) / [中文](docs/MANAGEMENT_API.md)
+- nginx capability comparison: [中文](docs/NGINX_COMPARISON.md)
 - Design and progress notes: [plans/PROJECT_CONTINUATION.md](plans/PROJECT_CONTINUATION.md)
 
 ## Verification

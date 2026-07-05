@@ -19,9 +19,10 @@
 
 ## HTTP 协议范围
 
-第一版只支持：
+当前已支持：
 
 - HTTP/1.1。
+- HTTP/2 cleartext prior-knowledge 入站连接。
 - 常见 method。
 - path。
 - query。
@@ -32,10 +33,11 @@
 第一版不支持：
 
 - HTTPS。
-- HTTP/2。
+- 基于 TLS + ALPN 的 HTTP/2。
+- HTTP/1.1 `Upgrade: h2c`。
 - HTTP/3。
 
-`ssl` 和 `http2` 配置第一阶段不实现。
+`ssl` 配置第一阶段不实现；`http2` 配置项仍不作为独立开关，当前 HTTP/2 支持为 cleartext prior-knowledge 入站能力。
 
 ## Proxy 行为
 
@@ -215,4 +217,3 @@ logs/admin.log
 ```
 
 `id` 由系统生成，示例中的 `id` 仅用于展示结构。
-

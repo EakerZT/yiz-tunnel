@@ -43,6 +43,9 @@
 ### HTTP 运行时
 
 - 当前能力范围内的 HTTP/1.1 请求解析。
+- 自实现 HTTP/2 cleartext prior-knowledge 入站连接支持。
+- 最小 HTTP/2 frame 处理，支持 SETTINGS、HEADERS、DATA、PING、CONTINUATION 和 GOAWAY。
+- 基础 HPACK 支持，包括静态表查询、动态表索引和 Huffman 解码。
 - 多 HTTP 服务运行时。
 - 单个 HTTP 服务的运行时应用和 reload。
 - 服务状态：`starting`、`running`、`stopping`、`stopped`、`failed`。
@@ -64,6 +67,7 @@
 ### 反向代理
 
 - 转发到 `http://` upstream。
+- HTTP/2 入站请求可以转发到 HTTP/1.1 upstream。
 - WebSocket upgrade 转发。
 - proxy header：`Host`、`X-Real-IP`、`X-Forwarded-For`、`X-Forwarded-Proto`。
 - upstream 响应流式转发。
@@ -97,7 +101,9 @@
 ## 未实现功能
 
 - TLS / HTTPS。
-- HTTP/2。
+- 基于 TLS + ALPN 的 HTTP/2。
+- HTTP/1.1 `Upgrade: h2c`。
+- 完整 HTTP/2 stream 状态机、流控、priority 和 reset 处理。
 - HTTP/3。
 - TCP 转发。
 - 管理 API 鉴权和授权。
@@ -166,6 +172,7 @@ curl.exe http://127.0.0.1:9000/api/v1/system/status
 
 - 快速开始：[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)
 - 管理 API：[中文](docs/MANAGEMENT_API.md) / [English](docs/MANAGEMENT_API.en.md)
+- nginx 能力对比：[docs/NGINX_COMPARISON.md](docs/NGINX_COMPARISON.md)
 - 设计和进度记录：[plans/PROJECT_CONTINUATION.md](plans/PROJECT_CONTINUATION.md)
 
 ## 验证

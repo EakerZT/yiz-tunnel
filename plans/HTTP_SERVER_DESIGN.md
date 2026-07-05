@@ -13,8 +13,8 @@
 
 - `listen` 使用对象结构。
 - `ssl` 第一阶段不实现。
-- `http2` 第一阶段不实现。
-- 第一阶段只支持 HTTP/1.1。
+- `http2` 已补充 cleartext prior-knowledge 入站能力，TLS + ALPN 后续实现。
+- 当前支持 HTTP/1.1 和 HTTP/2 cleartext prior-knowledge。
 - serverName 第一阶段只支持固定匹配，不支持通配符和正则。
 - `http-server` 添加 `alias` 字段，仅作为别名，无实际运行语义。
 - 路由字段使用 `routes`，不使用 `routers`。

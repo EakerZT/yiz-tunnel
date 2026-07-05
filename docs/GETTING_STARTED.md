@@ -289,7 +289,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-management-api
 第一版暂不包含：
 
 - 管理 API 鉴权。
-- HTTPS、HTTP/2、HTTP/3。
+- HTTPS、基于 TLS + ALPN 的 HTTP/2、HTTP/1.1 `Upgrade: h2c`、HTTP/3。
 - `tcp-forward`。
 - 完整 nginx 配置兼容。
 - chunked 请求体流式转发。
@@ -297,6 +297,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke-management-api
 当前已支持：
 
 - HTTP/1.1 静态文件服务。
+- HTTP/2 cleartext prior-knowledge 入站连接。
 - HTTP proxy。
 - WebSocket proxy。
 - `Content-Length` 请求体流式 proxy。

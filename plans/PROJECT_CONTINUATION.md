@@ -76,7 +76,7 @@
 - 已确认 `upstreams.priority` 数字越小优先级越高。
 - 已确认系统内部状态可以使用数字，对外管理接口统一使用字符串状态。
 - 已确认 `ssl` 第一阶段不实现。
-- 已确认 `http2` 第一阶段不实现。
+- 早期确认 `http2` 第一阶段不实现；后续已补充 HTTP/2 cleartext prior-knowledge 入站能力，TLS + ALPN 后续实现。
 - 已确认 `serverName` 第一阶段只支持固定匹配。
 - 已确认 `upstreams` 新增 `name` 字段，用于标识 upstream 名称。
 - 已提出蓝绿发布 group 方案：`upstreams` 添加 `group` 字段，`routes.action.proxy.upstream` 使用 `group` 作为路由目标。
@@ -171,7 +171,7 @@
 - 已确认管理 API 性能要求不高，可以使用外部 HTTP 服务库。
 - 已确认 `tcp-forward` 先不进入最小可用实现。
 - 已新增 `plans/MVP_SCOPE.md`，记录 HTTP MVP 范围。
-- 已确认 HTTP MVP 第一版只支持 HTTP/1.1，不支持 HTTPS、HTTP/2、HTTP/3。
+- 早期确认 HTTP MVP 第一版只支持 HTTP/1.1；后续已补充 HTTP/2 cleartext prior-knowledge 入站支持，HTTPS、TLS + ALPN、HTTP/3 仍未实现。
 - 已确认 proxy 除明确要求外参考 nginx；WebSocket 需要实现且默认开启。
 - 已确认静态文件第一版行为：404、403、少量内置 MIME、不支持 Range/ETag/Last-Modified/index。
 - 已确认 route 匹配规则：full 优先 prefix，prefix 取最长匹配，同一 `http-server` 下禁止重复 `match.type + match.path`。
@@ -302,6 +302,11 @@
 - `README.md` 已覆盖项目定位、文档入口、构建启动、配置目录、已支持能力、自动验证、第一版限制和开发约定。
 - 当前尚未实现更完整的 nginx proxy header 行为。
 - 已创建管理 API 接口文档 `docs/MANAGEMENT_API.md`。
+- 已实现自研 HTTP/2 cleartext prior-knowledge 入站支持，不直接依赖 `h2` / `http` / `bytes` 作为业务 HTTP runtime。
+- 已实现基础 HTTP/2 frame 处理：SETTINGS、HEADERS、DATA、PING、CONTINUATION、GOAWAY。
+- 已实现基础 HPACK 解码：静态表、连接级动态表、Huffman 字符串解码。
+- 已新增 HTTP/2 静态文件、HTTP/2 proxy rewrite、HPACK Huffman 和 HPACK 动态表自动测试。
+- 已运行 `cargo test --locked`，当前 33 个测试通过。
 
 ## 待讨论问题
 
@@ -355,7 +360,7 @@
 - 蓝绿发布状态获取：第一阶段由第三方调用管理接口查询状态，不做 Webhook、命令执行、消息队列等额外通知能力。
 - `upstreams.priority`：数字越小优先级越高。
 - 状态表达：配置使用布尔字段 `enabled` 表示启用/禁用；运行时使用独立的 `status`；对外管理接口使用字符串状态。
-- `ssl` 和 `http2`：第一阶段不实现。
+- `ssl`：第一阶段不实现；`http2` 已补充 cleartext prior-knowledge 入站能力，TLS + ALPN 后续实现。
 - `serverName`：第一阶段只支持固定匹配。
 - `upstreams.name`：用于标识 upstream 名称。
 - `upstreams.group`：作为 `routes.action.proxy.upstream` 的路由目标。
