@@ -120,7 +120,7 @@
 | --- | --- | --- |
 | `server` 块 | 部分实现 | 对应 `http-server`。 |
 | `listen` | 部分实现 | 支持 host/port；不支持 backlog、reuseport、ssl 等细项。 |
-| `server_name` | 部分实现 | 配置字段存在，但完整虚拟主机选择未实现。 |
+| `server_name` | 部分实现 | 支持同一 listen 下按固定 Host / `serverName` 匹配，并支持未命中时回到 default server；不支持通配符和正则。 |
 | location 精确匹配 | 已实现 | `match.type=0`。 |
 | location 前缀匹配 | 已实现 | `match.type=1`，最长前缀优先。 |
 | location regex | 未实现 | `match.type=2` 规划中，当前未实现。 |

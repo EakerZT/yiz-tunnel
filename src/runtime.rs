@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock as StdRwLock};
 use std::time::{Duration, SystemTime};
 
 use axum::http::StatusCode;
@@ -27,17 +27,24 @@ pub struct HttpRuntime {
 }
 
 struct RuntimeInner {
-    handles: Mutex<HashMap<String, ServerHandle>>,
+    listeners: Mutex<HashMap<String, ListenerHandle>>,
+    server_listens: Mutex<HashMap<String, String>>,
     infos: Mutex<HashMap<String, RuntimeInfo>>,
     proxy_state: ProxyState,
     active_connections: AtomicUsize,
     logger: LogManager,
 }
 
-struct ServerHandle {
+struct ListenerHandle {
     task: JoinHandle<()>,
-    listen: String,
-    config: Arc<RwLock<HttpServerConfig>>,
+    group: Arc<StdRwLock<ListenGroup>>,
+}
+
+#[derive(Default)]
+struct ListenGroup {
+    default_server_id: Option<String>,
+    order: Vec<String>,
+    servers: HashMap<String, Arc<RwLock<HttpServerConfig>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -59,6 +66,8 @@ struct HttpRequest {
 }
 
 struct AccessOutcome {
+    http_server_id: String,
+    http_server_alias: String,
     method: String,
     path: String,
     status: u16,
@@ -286,7 +295,8 @@ impl HttpRuntime {
     pub fn new(logger: LogManager) -> Self {
         Self {
             inner: Arc::new(RuntimeInner {
-                handles: Mutex::new(HashMap::new()),
+                listeners: Mutex::new(HashMap::new()),
+                server_listens: Mutex::new(HashMap::new()),
                 infos: Mutex::new(HashMap::new()),
                 proxy_state: ProxyState::default(),
                 active_connections: AtomicUsize::new(0),
@@ -297,44 +307,35 @@ impl HttpRuntime {
 
     pub async fn apply(&self, server: HttpServerConfig) -> Result<(), ApiError> {
         let addr = format!("{}:{}", server.listen.host, server.listen.port);
+        let existing_addr = self.server_listen(&server.id)?;
 
-        let existing_config = {
-            let handles = self
-                .inner
-                .handles
-                .lock()
-                .map_err(|_| ApiError::internal("runtime handle lock poisoned"))?;
-            handles.get(&server.id).and_then(|handle| {
-                if handle.listen == addr {
-                    Some(Arc::clone(&handle.config))
-                } else {
-                    None
-                }
-            })
-        };
-
-        if let Some(config) = existing_config {
-            let old_server = config.read().await.clone();
-            self.inner.proxy_state.reconcile_upstreams(
-                &server.id,
-                &old_server.upstreams,
-                &server.upstreams,
-            );
-            *config.write().await = server.clone();
-            let current = self.info_snapshot(&server.id)?;
-            self.set_info(
-                &server.id,
-                RuntimeInfo {
-                    status: "running".to_string(),
-                    active_connection_count: current.active_connection_count,
-                    active_request_count: current.active_request_count,
-                    last_error: None,
-                },
-            )?;
-            return Ok(());
+        if existing_addr.as_deref() == Some(addr.as_str()) {
+            if let Some(config) = self.server_config(&addr, &server.id)? {
+                let old_server = config.read().await.clone();
+                self.inner.proxy_state.reconcile_upstreams(
+                    &server.id,
+                    &old_server.upstreams,
+                    &server.upstreams,
+                );
+                *config.write().await = server.clone();
+                let current = self.info_snapshot(&server.id)?;
+                self.set_info(
+                    &server.id,
+                    RuntimeInfo {
+                        status: "running".to_string(),
+                        active_connection_count: current.active_connection_count,
+                        active_request_count: current.active_request_count,
+                        last_error: None,
+                    },
+                )?;
+                return Ok(());
+            }
         }
 
-        self.stop(&server.id)?;
+        if existing_addr.is_some() {
+            self.stop(&server.id)?;
+        }
+
         self.set_info(
             &server.id,
             RuntimeInfo {
@@ -345,47 +346,60 @@ impl HttpRuntime {
             },
         )?;
 
-        let listener = match TcpListener::bind(&addr).await {
-            Ok(listener) => listener,
-            Err(err) => {
-                self.set_info(
-                    &server.id,
-                    RuntimeInfo {
-                        status: "failed".to_string(),
-                        active_connection_count: 0,
-                        active_request_count: 0,
-                        last_error: Some(err.to_string()),
-                    },
-                )?;
-                return Err(ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    31000,
-                    format!("failed to bind {addr}: {err}"),
-                ));
+        let server_id = server.id.clone();
+        let config = Arc::new(RwLock::new(server));
+        let group = match self.listener_group(&addr)? {
+            Some(group) => group,
+            None => {
+                let listener = match TcpListener::bind(&addr).await {
+                    Ok(listener) => listener,
+                    Err(err) => {
+                        self.set_info(
+                            &server_id,
+                            RuntimeInfo {
+                                status: "failed".to_string(),
+                                active_connection_count: 0,
+                                active_request_count: 0,
+                                last_error: Some(err.to_string()),
+                            },
+                        )?;
+                        return Err(ApiError::new(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            31000,
+                            format!("failed to bind {addr}: {err}"),
+                        ));
+                    }
+                };
+
+                let group = Arc::new(StdRwLock::new(ListenGroup::default()));
+                let inner = Arc::clone(&self.inner);
+                let task_group = Arc::clone(&group);
+                let task = tokio::spawn(async move {
+                    accept_loop(inner, task_group, listener).await;
+                });
+
+                self.inner
+                    .listeners
+                    .lock()
+                    .map_err(|_| ApiError::internal("runtime listener lock poisoned"))?
+                    .insert(
+                        addr.clone(),
+                        ListenerHandle {
+                            task,
+                            group: Arc::clone(&group),
+                        },
+                    );
+
+                group
             }
         };
 
-        let server_id = server.id.clone();
-        let task_server_id = server_id.clone();
-        let config = Arc::new(RwLock::new(server));
-        let inner = Arc::clone(&self.inner);
-        let task_config = Arc::clone(&config);
-        let task = tokio::spawn(async move {
-            accept_loop(inner, task_server_id, task_config, listener).await;
-        });
-
+        insert_server_config(&group, server_id.clone(), config)?;
         self.inner
-            .handles
+            .server_listens
             .lock()
-            .map_err(|_| ApiError::internal("runtime handle lock poisoned"))?
-            .insert(
-                server_id.clone(),
-                ServerHandle {
-                    task,
-                    listen: addr,
-                    config,
-                },
-            );
+            .map_err(|_| ApiError::internal("runtime server listen lock poisoned"))?
+            .insert(server_id.clone(), addr);
 
         self.set_info(
             &server_id,
@@ -401,15 +415,7 @@ impl HttpRuntime {
     }
 
     pub fn stop(&self, id: &str) -> Result<(), ApiError> {
-        if let Some(handle) = self
-            .inner
-            .handles
-            .lock()
-            .map_err(|_| ApiError::internal("runtime handle lock poisoned"))?
-            .remove(id)
-        {
-            handle.task.abort();
-        }
+        self.remove_server_from_listener(id)?;
 
         let current = self.info_snapshot(id)?;
         let status = if current.active_connection_count > 0 {
@@ -513,35 +519,142 @@ impl HttpRuntime {
                 last_error: None,
             }))
     }
+
+    fn server_listen(&self, id: &str) -> Result<Option<String>, ApiError> {
+        Ok(self
+            .inner
+            .server_listens
+            .lock()
+            .map_err(|_| ApiError::internal("runtime server listen lock poisoned"))?
+            .get(id)
+            .cloned())
+    }
+
+    fn listener_group(&self, addr: &str) -> Result<Option<Arc<StdRwLock<ListenGroup>>>, ApiError> {
+        Ok(self
+            .inner
+            .listeners
+            .lock()
+            .map_err(|_| ApiError::internal("runtime listener lock poisoned"))?
+            .get(addr)
+            .map(|listener| Arc::clone(&listener.group)))
+    }
+
+    fn server_config(
+        &self,
+        addr: &str,
+        id: &str,
+    ) -> Result<Option<Arc<RwLock<HttpServerConfig>>>, ApiError> {
+        let Some(group) = self.listener_group(addr)? else {
+            return Ok(None);
+        };
+
+        Ok(group
+            .read()
+            .map_err(|_| ApiError::internal("runtime listener group lock poisoned"))?
+            .servers
+            .get(id)
+            .cloned())
+    }
+
+    fn remove_server_from_listener(&self, id: &str) -> Result<(), ApiError> {
+        let addr = self
+            .inner
+            .server_listens
+            .lock()
+            .map_err(|_| ApiError::internal("runtime server listen lock poisoned"))?
+            .remove(id);
+
+        let Some(addr) = addr else {
+            return Ok(());
+        };
+
+        let remove_listener = {
+            let listeners = self
+                .inner
+                .listeners
+                .lock()
+                .map_err(|_| ApiError::internal("runtime listener lock poisoned"))?;
+            let Some(listener) = listeners.get(&addr) else {
+                return Ok(());
+            };
+            let mut group = listener
+                .group
+                .write()
+                .map_err(|_| ApiError::internal("runtime listener group lock poisoned"))?;
+            remove_server_config(&mut group, id);
+            group.servers.is_empty()
+        };
+
+        if remove_listener {
+            if let Some(listener) = self
+                .inner
+                .listeners
+                .lock()
+                .map_err(|_| ApiError::internal("runtime listener lock poisoned"))?
+                .remove(&addr)
+            {
+                listener.task.abort();
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn insert_server_config(
+    group: &Arc<StdRwLock<ListenGroup>>,
+    id: String,
+    config: Arc<RwLock<HttpServerConfig>>,
+) -> Result<(), ApiError> {
+    let mut group = group
+        .write()
+        .map_err(|_| ApiError::internal("runtime listener group lock poisoned"))?;
+    if !group.servers.contains_key(&id) {
+        group.order.push(id.clone());
+    }
+    if group.default_server_id.is_none() {
+        group.default_server_id = Some(id.clone());
+    }
+    group.servers.insert(id, config);
+    Ok(())
+}
+
+fn remove_server_config(group: &mut ListenGroup, id: &str) {
+    group.servers.remove(id);
+    group.order.retain(|item| item != id);
+    if group.default_server_id.as_deref() == Some(id) {
+        group.default_server_id = group.order.first().cloned();
+    }
 }
 
 async fn accept_loop(
     inner: Arc<RuntimeInner>,
-    server_id: String,
-    config: Arc<RwLock<HttpServerConfig>>,
+    group: Arc<StdRwLock<ListenGroup>>,
     listener: TcpListener,
 ) {
     while let Ok((stream, remote_addr)) = listener.accept().await {
-        let config = Arc::clone(&config);
+        let group = Arc::clone(&group);
         let inner = Arc::clone(&inner);
-        let server_id = server_id.clone();
         tokio::spawn(async move {
-            increment_connection(&inner, &server_id);
-            match handle_connection(
+            let connection_server_id = default_server_id(&group);
+            if let Some(server_id) = connection_server_id.as_deref() {
+                increment_connection(&inner, server_id);
+            }
+            match handle_connection_group(
                 stream,
-                Arc::clone(&config),
+                Arc::clone(&group),
                 remote_addr.to_string(),
                 inner.proxy_state.clone(),
             )
             .await
             {
                 Ok(outcomes) => {
-                    let alias = config.read().await.alias.clone();
                     for outcome in outcomes {
                         inner.logger.access(AccessLogEntry {
                             remote_address: remote_addr.to_string(),
-                            http_server_id: server_id.clone(),
-                            http_server_alias: alias.clone(),
+                            http_server_id: outcome.http_server_id,
+                            http_server_alias: outcome.http_server_alias,
                             method: outcome.method,
                             path: outcome.path,
                             status: outcome.status,
@@ -560,9 +673,18 @@ async fn accept_loop(
                     );
                 }
             }
-            decrement_connection(&inner, &server_id);
+            if let Some(server_id) = connection_server_id.as_deref() {
+                decrement_connection(&inner, server_id);
+            }
         });
     }
+}
+
+fn default_server_id(group: &Arc<StdRwLock<ListenGroup>>) -> Option<String> {
+    group
+        .read()
+        .ok()
+        .and_then(|group| group.default_server_id.clone())
 }
 
 fn increment_connection(inner: &RuntimeInner, id: &str) {
@@ -647,117 +769,17 @@ async fn handle_connection(
             Err(err) => return Err(err),
         };
 
-        let server = config.read().await.clone();
-        let server_conf = RuntimeConf::from_value(&server.conf);
         handled += 1;
-        let start = std::time::Instant::now();
-        let path = request_path(&request.target);
-        let keep_alive =
-            request_keep_alive(&request) && handled < server_conf.keepalive_requests.max(1);
-        let mut close_after_response = !keep_alive;
-        if !request.body_complete {
-            close_after_response = true;
-        }
-
-        let result = if let Some(route) = select_route(&server.routes, path) {
-            let route_conf = RuntimeConf::for_route(&server.conf, &route.conf);
-            match route.action.r#type.as_str() {
-                "file" => {
-                    if let Some(file) = &route.action.file {
-                        let status = serve_file(
-                            &mut stream,
-                            route,
-                            file,
-                            path,
-                            keep_alive,
-                            &request,
-                            &route_conf,
-                        )
-                        .await?;
-                        outcome(
-                            &request,
-                            path,
-                            status,
-                            start.elapsed().as_millis(),
-                            None,
-                            None,
-                        )
-                    } else {
-                        write_simple_response(
-                            &mut stream,
-                            500,
-                            "Internal Server Error",
-                            b"file action missing",
-                            "text/plain",
-                            keep_alive,
-                            route_conf.send_timeout,
-                        )
-                        .await?;
-                        outcome(&request, path, 500, start.elapsed().as_millis(), None, None)
-                    }
-                }
-                "proxy" => {
-                    close_after_response = true;
-                    if let Some(proxy) = &route.action.proxy {
-                        let (status, upstream_id, upstream_name) = serve_proxy(
-                            &mut stream,
-                            &server,
-                            proxy,
-                            &request,
-                            &remote_address,
-                            &route_conf,
-                            &proxy_state,
-                        )
-                        .await?;
-                        outcome(
-                            &request,
-                            path,
-                            status,
-                            start.elapsed().as_millis(),
-                            upstream_id,
-                            upstream_name,
-                        )
-                    } else {
-                        write_simple_response(
-                            &mut stream,
-                            500,
-                            "Internal Server Error",
-                            b"proxy action missing",
-                            "text/plain",
-                            false,
-                            route_conf.send_timeout,
-                        )
-                        .await?;
-                        outcome(&request, path, 500, start.elapsed().as_millis(), None, None)
-                    }
-                }
-                _ => {
-                    write_simple_response(
-                        &mut stream,
-                        500,
-                        "Internal Server Error",
-                        b"unsupported action",
-                        "text/plain",
-                        keep_alive,
-                        route_conf.send_timeout,
-                    )
-                    .await?;
-                    outcome(&request, path, 500, start.elapsed().as_millis(), None, None)
-                }
-            }
-        } else {
-            write_simple_response(
-                &mut stream,
-                404,
-                "Not Found",
-                b"not found",
-                "text/plain",
-                keep_alive,
-                server_conf.send_timeout,
-            )
-            .await?;
-            outcome(&request, path, 404, start.elapsed().as_millis(), None, None)
-        };
+        let server = config.read().await.clone();
+        let (result, close_after_response) = handle_http_request(
+            &mut stream,
+            &server,
+            request,
+            &remote_address,
+            &proxy_state,
+            handled,
+        )
+        .await?;
 
         outcomes.push(result);
 
@@ -767,6 +789,239 @@ async fn handle_connection(
     }
 
     Ok(outcomes)
+}
+
+async fn handle_connection_group(
+    mut stream: TcpStream,
+    group: Arc<StdRwLock<ListenGroup>>,
+    remote_address: String,
+    proxy_state: ProxyState,
+) -> io::Result<Vec<AccessOutcome>> {
+    let default_config = select_server_config(&group, None)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no default http-server"))?;
+    let first_conf = {
+        let server = default_config.read().await;
+        RuntimeConf::from_value(&server.conf)
+    };
+    if is_h2_prior_knowledge(&stream, first_conf.client_header_timeout).await? {
+        return handle_h2_connection_group(stream, group, remote_address, proxy_state).await;
+    }
+
+    let mut outcomes = Vec::new();
+    let mut handled = 0_usize;
+
+    loop {
+        let read_conf = {
+            let server = default_config.read().await;
+            RuntimeConf::from_value(&server.conf)
+        };
+        let header_timeout = if handled == 0 {
+            read_conf.client_header_timeout
+        } else {
+            read_conf.keepalive_timeout
+        };
+        let request = match read_http_request(
+            &mut stream,
+            header_timeout,
+            read_conf.client_body_timeout,
+            read_conf.client_max_body_size,
+        )
+        .await
+        {
+            Ok(Some(request)) => request,
+            Ok(None) => break,
+            Err(err)
+                if err.kind() == io::ErrorKind::InvalidData
+                    && err.to_string() == "request body too large" =>
+            {
+                write_simple_response(
+                    &mut stream,
+                    413,
+                    "Payload Too Large",
+                    b"payload too large",
+                    "text/plain",
+                    false,
+                    read_conf.send_timeout,
+                )
+                .await?;
+                break;
+            }
+            Err(err) if err.kind() == io::ErrorKind::TimedOut => {
+                break;
+            }
+            Err(err) => return Err(err),
+        };
+
+        handled += 1;
+        let selected_config = select_server_config(&group, request_host(&request))
+            .unwrap_or_else(|| Arc::clone(&default_config));
+        let server = selected_config.read().await.clone();
+        let (result, close_after_response) = handle_http_request(
+            &mut stream,
+            &server,
+            request,
+            &remote_address,
+            &proxy_state,
+            handled,
+        )
+        .await?;
+
+        outcomes.push(result);
+
+        if close_after_response {
+            break;
+        }
+    }
+
+    Ok(outcomes)
+}
+
+async fn handle_http_request(
+    stream: &mut TcpStream,
+    server: &HttpServerConfig,
+    request: HttpRequest,
+    remote_address: &str,
+    proxy_state: &ProxyState,
+    handled: usize,
+) -> io::Result<(AccessOutcome, bool)> {
+    let server_conf = RuntimeConf::from_value(&server.conf);
+    let start = std::time::Instant::now();
+    let path = request_path(&request.target);
+    let keep_alive =
+        request_keep_alive(&request) && handled < server_conf.keepalive_requests.max(1);
+    let mut close_after_response = !keep_alive;
+    if !request.body_complete {
+        close_after_response = true;
+    }
+
+    let result = if let Some(route) = select_route(&server.routes, path) {
+        let route_conf = RuntimeConf::for_route(&server.conf, &route.conf);
+        match route.action.r#type.as_str() {
+            "file" => {
+                if let Some(file) = &route.action.file {
+                    let status =
+                        serve_file(stream, route, file, path, keep_alive, &request, &route_conf)
+                            .await?;
+                    outcome(
+                        server,
+                        &request,
+                        path,
+                        status,
+                        start.elapsed().as_millis(),
+                        None,
+                        None,
+                    )
+                } else {
+                    write_simple_response(
+                        stream,
+                        500,
+                        "Internal Server Error",
+                        b"file action missing",
+                        "text/plain",
+                        keep_alive,
+                        route_conf.send_timeout,
+                    )
+                    .await?;
+                    outcome(
+                        server,
+                        &request,
+                        path,
+                        500,
+                        start.elapsed().as_millis(),
+                        None,
+                        None,
+                    )
+                }
+            }
+            "proxy" => {
+                close_after_response = true;
+                if let Some(proxy) = &route.action.proxy {
+                    let (status, upstream_id, upstream_name) = serve_proxy(
+                        stream,
+                        server,
+                        proxy,
+                        &request,
+                        remote_address,
+                        &route_conf,
+                        proxy_state,
+                    )
+                    .await?;
+                    outcome(
+                        server,
+                        &request,
+                        path,
+                        status,
+                        start.elapsed().as_millis(),
+                        upstream_id,
+                        upstream_name,
+                    )
+                } else {
+                    write_simple_response(
+                        stream,
+                        500,
+                        "Internal Server Error",
+                        b"proxy action missing",
+                        "text/plain",
+                        false,
+                        route_conf.send_timeout,
+                    )
+                    .await?;
+                    outcome(
+                        server,
+                        &request,
+                        path,
+                        500,
+                        start.elapsed().as_millis(),
+                        None,
+                        None,
+                    )
+                }
+            }
+            _ => {
+                write_simple_response(
+                    stream,
+                    500,
+                    "Internal Server Error",
+                    b"unsupported action",
+                    "text/plain",
+                    keep_alive,
+                    route_conf.send_timeout,
+                )
+                .await?;
+                outcome(
+                    server,
+                    &request,
+                    path,
+                    500,
+                    start.elapsed().as_millis(),
+                    None,
+                    None,
+                )
+            }
+        }
+    } else {
+        write_simple_response(
+            stream,
+            404,
+            "Not Found",
+            b"not found",
+            "text/plain",
+            keep_alive,
+            server_conf.send_timeout,
+        )
+        .await?;
+        outcome(
+            server,
+            &request,
+            path,
+            404,
+            start.elapsed().as_millis(),
+            None,
+            None,
+        )
+    };
+
+    Ok((result, close_after_response))
 }
 
 const H2_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -897,6 +1152,92 @@ async fn handle_h2_connection(
     Ok(outcomes)
 }
 
+async fn handle_h2_connection_group(
+    mut stream: TcpStream,
+    group: Arc<StdRwLock<ListenGroup>>,
+    remote_address: String,
+    proxy_state: ProxyState,
+) -> io::Result<Vec<AccessOutcome>> {
+    let mut preface = [0_u8; 24];
+    stream.read_exact(&mut preface).await?;
+    if &preface != H2_PREFACE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid http/2 connection preface",
+        ));
+    }
+
+    write_h2_frame(&mut stream, H2_FRAME_SETTINGS, 0, 0, &[]).await?;
+    let mut outcomes = Vec::new();
+    let mut streams = HashMap::<u32, H2StreamState>::new();
+    let mut hpack = HpackDecoder::new();
+
+    while let Some(frame) = read_h2_frame(&mut stream).await? {
+        match frame.frame_type {
+            H2_FRAME_SETTINGS => {
+                if frame.flags & H2_FLAG_ACK == 0 {
+                    write_h2_frame(&mut stream, H2_FRAME_SETTINGS, H2_FLAG_ACK, 0, &[]).await?;
+                }
+            }
+            H2_FRAME_HEADERS => {
+                let mut header_block = h2_headers_payload(&frame)?;
+                if frame.flags & H2_FLAG_END_HEADERS == 0 {
+                    header_block.extend(read_h2_continuations(&mut stream, frame.stream_id).await?);
+                }
+                let headers = hpack.decode(&header_block)?;
+                let state = streams
+                    .entry(frame.stream_id)
+                    .or_insert_with(H2StreamState::default);
+                state.headers = headers;
+                if frame.flags & H2_FLAG_END_STREAM != 0 {
+                    let state = streams.remove(&frame.stream_id).unwrap_or_default();
+                    let config = select_h2_server_config(&group, &state)
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no http-server"))?;
+                    let outcome = handle_h2_request(
+                        &mut stream,
+                        frame.stream_id,
+                        state,
+                        config,
+                        remote_address.clone(),
+                        proxy_state.clone(),
+                    )
+                    .await?;
+                    outcomes.push(outcome);
+                }
+            }
+            H2_FRAME_DATA => {
+                let data = h2_data_payload(&frame)?;
+                let state = streams
+                    .entry(frame.stream_id)
+                    .or_insert_with(H2StreamState::default);
+                state.body.extend_from_slice(&data);
+                if frame.flags & H2_FLAG_END_STREAM != 0 {
+                    let state = streams.remove(&frame.stream_id).unwrap_or_default();
+                    let config = select_h2_server_config(&group, &state)
+                        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no http-server"))?;
+                    let outcome = handle_h2_request(
+                        &mut stream,
+                        frame.stream_id,
+                        state,
+                        config,
+                        remote_address.clone(),
+                        proxy_state.clone(),
+                    )
+                    .await?;
+                    outcomes.push(outcome);
+                }
+            }
+            H2_FRAME_PING if frame.flags & H2_FLAG_ACK == 0 && frame.payload.len() == 8 => {
+                write_h2_frame(&mut stream, H2_FRAME_PING, H2_FLAG_ACK, 0, &frame.payload).await?;
+            }
+            H2_FRAME_GOAWAY => break,
+            _ => {}
+        }
+    }
+
+    Ok(outcomes)
+}
+
 #[derive(Default)]
 struct H2StreamState {
     headers: Vec<(String, String)>,
@@ -937,6 +1278,8 @@ async fn handle_h2_request(
             simple_runtime_response(413, "Payload Too Large", b"payload too large", "text/plain");
         send_h2_response(stream, stream_id, response).await?;
         return Ok(AccessOutcome {
+            http_server_id: server.id.clone(),
+            http_server_alias: server.alias.clone(),
             method,
             path,
             status: 413,
@@ -967,6 +1310,7 @@ async fn handle_h2_request(
     send_h2_response(stream, stream_id, response).await?;
 
     Ok(outcome(
+        &server,
         &request,
         &path,
         status,
@@ -2595,6 +2939,7 @@ fn parse_http_upstream(value: &str) -> Option<(String, u16)> {
 }
 
 fn outcome(
+    server: &HttpServerConfig,
     request: &HttpRequest,
     path: &str,
     status: u16,
@@ -2603,6 +2948,8 @@ fn outcome(
     upstream_name: Option<String>,
 ) -> AccessOutcome {
     AccessOutcome {
+        http_server_id: server.id.clone(),
+        http_server_alias: server.alias.clone(),
         method: request.method.clone(),
         path: path.to_string(),
         status,
@@ -2647,6 +2994,78 @@ fn request_header<'a>(request: &'a HttpRequest, name: &str) -> Option<&'a str> {
         .iter()
         .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
         .map(|(_, value)| value.as_str())
+}
+
+fn request_host(request: &HttpRequest) -> Option<&str> {
+    request_header(request, "host")
+}
+
+fn select_h2_server_config(
+    group: &Arc<StdRwLock<ListenGroup>>,
+    state: &H2StreamState,
+) -> Option<Arc<RwLock<HttpServerConfig>>> {
+    select_server_config(group, h2_header(&state.headers, ":authority"))
+}
+
+fn select_server_config(
+    group: &Arc<StdRwLock<ListenGroup>>,
+    host: Option<&str>,
+) -> Option<Arc<RwLock<HttpServerConfig>>> {
+    let (default_id, configs) = {
+        let group = group.read().ok()?;
+        (
+            group.default_server_id.clone(),
+            group
+                .order
+                .iter()
+                .filter_map(|id| group.servers.get(id).cloned())
+                .collect::<Vec<_>>(),
+        )
+    };
+
+    if let Some(host) = host.and_then(normalize_host) {
+        for config in &configs {
+            if let Ok(server) = config.try_read() {
+                if server
+                    .listen
+                    .server_name
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&host))
+                {
+                    return Some(Arc::clone(config));
+                }
+            }
+        }
+    }
+
+    let default_id = default_id?;
+    configs.into_iter().find(|config| {
+        config
+            .try_read()
+            .map(|server| server.id == default_id)
+            .unwrap_or(false)
+    })
+}
+
+fn normalize_host(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    if value.starts_with('[') {
+        return value
+            .split_once(']')
+            .map(|(host, _)| format!("{host}]"))
+            .or_else(|| Some(value.to_string()));
+    }
+
+    match value.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') && port.parse::<u16>().is_ok() => {
+            Some(host.to_string())
+        }
+        _ => Some(value.to_string()),
+    }
 }
 
 fn parse_byte_range(value: &str, size: u64) -> Option<(u64, u64)> {
@@ -4123,6 +4542,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_listener_selects_server_by_host_and_uses_default() {
+        let root = std::env::temp_dir().join(format!(
+            "yiz-tunnel-server-name-{}",
+            Uuid::now_v7().simple()
+        ));
+        let default_dir = root.join("default");
+        let named_dir = root.join("named");
+        tokio::fs::create_dir_all(&default_dir).await.unwrap();
+        tokio::fs::create_dir_all(&named_dir).await.unwrap();
+        tokio::fs::write(default_dir.join("hello.txt"), b"default")
+            .await
+            .unwrap();
+        tokio::fs::write(named_dir.join("hello.txt"), b"named")
+            .await
+            .unwrap();
+
+        let port = free_tcp_port();
+        let runtime = HttpRuntime::new(LogManager::new(root.join("logs")).unwrap());
+
+        let mut default_server = test_server();
+        default_server.id = "hs_default".to_string();
+        default_server.alias = "default".to_string();
+        default_server.listen.port = port;
+        default_server.listen.server_name = vec!["default.local".to_string()];
+        default_server.routes.push(static_route(&default_dir));
+
+        let mut named_server = test_server();
+        named_server.id = "hs_named".to_string();
+        named_server.alias = "named".to_string();
+        named_server.listen.port = port;
+        named_server.listen.server_name = vec!["api.local".to_string()];
+        named_server.routes.push(static_route(&named_dir));
+
+        runtime.apply(default_server.clone()).await.unwrap();
+        runtime.apply(named_server.clone()).await.unwrap();
+
+        let named_response = send_runtime_request(
+            port,
+            &format!(
+                "GET /hello.txt HTTP/1.1\r\nHost: api.local:{port}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(named_response.ends_with("named"));
+
+        let default_response = send_runtime_request(
+            port,
+            "GET /hello.txt HTTP/1.1\r\nHost: unknown.local\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(default_response.ends_with("default"));
+
+        runtime.stop(&named_server.id).unwrap();
+        runtime.stop(&default_server.id).unwrap();
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
     async fn proxy_tracks_active_upstream_request_count() {
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
@@ -4288,6 +4765,37 @@ mod tests {
     fn free_tcp_port() -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap().port()
+    }
+
+    fn static_route(dir: &Path) -> RouteConfig {
+        RouteConfig {
+            id: format!("rt_{}", Uuid::now_v7().simple()),
+            match_rule: RouteMatch {
+                r#type: 1,
+                path: "/".to_string(),
+            },
+            action: RouteAction {
+                r#type: "file".to_string(),
+                file: Some(FileAction {
+                    dir: dir.display().to_string(),
+                    alias: 0,
+                }),
+                proxy: None,
+            },
+            conf: Value::Object(Default::default()),
+        }
+    }
+
+    async fn send_runtime_request(port: u16, request: &str) -> String {
+        let mut client = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        String::from_utf8(response).unwrap()
     }
 
     async fn send_one_request(server: HttpServerConfig, request: &str) -> String {

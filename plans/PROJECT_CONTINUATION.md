@@ -2,18 +2,19 @@
 
 ## 当前状态
 
-- 记录日期：2026-06-29
-- 工作目录：`C:\Users\80982\Desktop\eaker\tunnel`
-- 仓库状态：当前目录已存在 Git 仓库，当前分支为 `master`，尚无提交。
-- 可见项目文件：根目录包含 `.idea`、`plans` 和 `nginx-release-1.31.2`。
-- nginx 源码：根目录下存在 `nginx-release-1.31.2`，可作为参考源码。
-- 实现状态：根据要求，本轮尚未开始任何实现工作。
+- 记录日期：2026-07-06
+- 工作目录：`C:\Users\80982\Desktop\eaker\yiz-tunnel`
+- 仓库状态：当前目录已存在 Git 仓库，当前分支为 `main`。
+- 可见项目文件：根目录包含 Rust 源码、文档、计划、脚本、GitHub Actions 和构建产物目录。
+- 实现状态：HTTP MVP 主体能力已经实现；`tcp-forward`、TLS、`serverName` 通配符/正则匹配、管理 API 鉴权仍未实现。
+- 验证状态：`cargo test` 当前 41 个测试通过；管理 API 冒烟脚本通过。
+- 当前推进阶段：已完成 HTTP 控制面校验和固定 `serverName` / default server 行为，下一步进入 Proxy 常用能力增强。
 
 ## 工作约定
 
-- 在目标、范围、约束和验收标准讨论清楚之前，不开始实现。
 - 将计划、进度和未解决问题记录在本文档中，便于后续继续推进。
-- 后续如需编辑业务代码或源码，应先在本文档中记录计划变更和讨论结论。
+- 后续实现按小里程碑推进，每个里程碑需要有明确验收方式。
+- 涉及协议、配置 schema 或管理 API 行为变更时，应同步更新 `docs/` 和 `plans/`。
 
 ## 初步计划
 
@@ -173,7 +174,7 @@
 - 已新增 `plans/MVP_SCOPE.md`，记录 HTTP MVP 范围。
 - 早期确认 HTTP MVP 第一版只支持 HTTP/1.1；后续已补充 HTTP/2 cleartext prior-knowledge 入站支持，HTTPS、TLS + ALPN、HTTP/3 仍未实现。
 - 已确认 proxy 除明确要求外参考 nginx；WebSocket 需要实现且默认开启。
-- 已确认静态文件第一版行为：404、403、少量内置 MIME、不支持 Range/ETag/Last-Modified/index。
+- 早期确认静态文件第一版行为：404、403、少量内置 MIME，未包含 Range/ETag/Last-Modified/index；后续已补充 Range、ETag 和 Last-Modified。
 - 已确认 route 匹配规则：full 优先 prefix，prefix 取最长匹配，同一 `http-server` 下禁止重复 `match.type + match.path`。
 - 已确认第一版日志文件为 `access.log`、`error.log`、`admin.log`。
 - 已确认第一版 JSON 示例可以作为实现和测试依据。
@@ -306,9 +307,33 @@
 - 已实现基础 HTTP/2 frame 处理：SETTINGS、HEADERS、DATA、PING、CONTINUATION、GOAWAY。
 - 已实现基础 HPACK 解码：静态表、连接级动态表、Huffman 字符串解码。
 - 已新增 HTTP/2 静态文件、HTTP/2 proxy rewrite、HPACK Huffman 和 HPACK 动态表自动测试。
-- 已运行 `cargo test --locked`，当前 33 个测试通过。
+- 已运行 `cargo test --locked`，当时 33 个测试通过。
 
-## 待讨论问题
+### 2026-07-06
+
+- 已梳理 `plans/` 下计划文档，并确认当前实现已经超过早期 HTTP MVP 范围。
+- 已新增根目录 `AGENTS.md`，记录仓库结构、构建测试命令和开发注意事项。
+- 已完成配置与管理 API 校验补强：
+  - 系统配置加载时校验 `version`、目录字段和管理 API 监听字段。
+  - `http-server` 创建/更新时校验 `listen` 和 `graceful.type`。
+  - upstream 创建时校验 `group`、`name` 和 `http://` host。
+  - `graceful.enabled=false` 时拒绝同 `group + name` upstream 替换。
+  - 新增 proxy route 时校验目标 upstream group 已存在。
+  - file route 校验 `dir` 非空，`alias` 只允许 `0` 或 `1`。
+  - `http-server.json` 加载和事务写入前校验版本、重复 ID 和重复 route match。
+- 已新增配置校验相关自动测试。
+- 已运行 `cargo test`，当时 40 个测试通过。
+- 已运行 `scripts/smoke-management-api.ps1`，验证通过。
+- 已同步 `plans/MVP_SCOPE.md` 中静态文件能力描述，修正 Range、ETag、Last-Modified 已实现的过期描述。
+- 已实现同一监听地址下的固定 `serverName` / `Host` 匹配。
+- 已实现 default server 行为：同一监听地址下未命中 `serverName` 时使用第一个应用到 runtime 的 `http-server`。
+- 已新增同端口多 `http-server` 真实 I/O 自动测试。
+- 已运行 `cargo test`，当前 41 个测试通过。
+- 已运行 `scripts/smoke-management-api.ps1`，验证通过。
+
+## 历史待讨论问题
+
+以下问题来自项目启动早期，部分已经在后续设计和实现中确认或完成；当前执行以后文“下一步实施计划”为准。
 
 1. 目标是完整替代 nginx，还是先实现 nginx 的一个子集？
 2. “核心逻辑基本参考 nginx”具体包括哪些部分？
@@ -418,27 +443,34 @@
 
 ## 风险与未知项
 
-- 当前工作目录已有 nginx 参考源码，但还没有 `yiz-tunnel` 的 Rust 源码，因此暂时没有本项目的既有代码风格或架构模式可遵循。
-- Rust 重写 nginx 涉及网络 IO、事件模型、配置系统、HTTP 协议、代理行为和性能优化，范围较大，需要先收敛第一阶段目标。
-- HTTP 代理、TCP 转发、管理服务和日志系统会共享运行时、配置、状态和观测能力，需要先确定边界，避免早期架构频繁返工。
-- JSON 配置和规则存储需要设计清晰的 schema，否则管理服务、热更新和运行时状态容易混杂。
-- 蓝绿发布需要准确维护 upstream 级别的活动请求数/连接数，否则无法可靠判断 `deading` upstream 是否可以关闭。
+- HTTP runtime 已经具备较多自研协议逻辑，后续修改要用真实 I/O 测试覆盖，避免 keep-alive、HTTP/2 和 proxy 流式转发回归。
+- 同端口多 `http-server` 已改为 listener group 模型；后续如果补通配符、正则或 TLS SNI，需要继续复用这一路径。
+- 蓝绿发布依赖 upstream 活动请求数，后续如果引入 WebSocket、连接池或 HTTP/2 多 stream 统计，需要重新确认计数语义。
+- JSON schema、管理 API 文档和计划文档必须同步维护，否则用户可见行为容易与实现不一致。
+- TLS、TCP stream、限流、压缩和 metrics 都会扩大运行时边界，应在 HTTP 核心行为稳定后再进入。
 - 如果参考 nginx 源码，需要明确许可证、版权声明和代码来源边界，避免不清晰的代码移植风险。
-- 在具体调整项未明确前，架构设计仍可能变化。
-- 当前 Git 仓库尚无提交，后续应在实现前确认是否先提交现有计划文档和参考源码状态。
+- 当前管理 API 第一阶段无鉴权，生产部署前需要补鉴权、绑定限制或外部访问控制说明。
 
-## 下一步讨论议程
+## 下一步实施计划
 
-1. 继续细化 `plans/HTTP_SERVER_DESIGN.md` 中的 `http-server` 字段语义。
-2. 确认 HTTP 代理的具体类型和第一阶段协议范围。
-3. 确认 TCP 1 对 1 转发的配置方式和连接行为。
-4. 设计 JSON 主配置和规则配置的第一版 schema，明确 `system-conf`、`http-server`、`tcp-forward` 的独立结构。
-5. 确认 HTTP 管理服务的接口范围和安全要求。
-6. 确认 `http-server` 管理、`tcp-forward` 管理和系统状态查看的具体 API。
-7. 确认日志系统的日志类型、格式和输出目标。
-8. 明确需要调整 nginx 的哪些行为或架构。
-9. 确认 Rust 技术选型：异步运行时、TLS 库、HTTP 解析库、日志库、配置解析策略。
-10. 确认许可证和源码参考边界。
-11. 用具体的用户可感知结果定义第一个里程碑。
-12. 将已确认事项整理为实现清单。
-13. 在完成上述讨论后再开始实现。
+1. Proxy 常用能力增强。
+   - chunked request body 直接流式转发。
+   - 增加可配置 request/response header set/remove。
+   - 继续补 upstream 失败场景测试。
+
+2. 静态文件常用行为。
+   - 支持 `index`。
+   - 支持基础 `try_files`。
+   - 扩充 MIME 类型。
+
+3. HTTP/2 协议正确性。
+   - 补 RST_STREAM。
+   - 补 WINDOW_UPDATE 和基础流控。
+   - 补 SETTINGS 限制处理。
+   - 收敛更完整的 stream 状态机。
+
+4. 后续阶段评估。
+   - TLS / HTTPS / ALPN。
+   - 管理 API 鉴权和绑定限制。
+   - TCP stream。
+   - 限流、压缩、metrics。

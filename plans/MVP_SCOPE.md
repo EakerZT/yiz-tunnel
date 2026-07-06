@@ -55,16 +55,24 @@
 
 ## 静态文件行为
 
-第一版静态文件行为：
+当前已支持：
 
 - 文件不存在返回 `404`。
 - 目录访问返回 `403`。
 - 权限不足返回 `403`。
 - MIME type 先内置少量常见类型，不依赖库。
-- 不支持 Range。
-- 不支持 ETag。
-- 不支持 Last-Modified。
+- `ETag`。
+- `Last-Modified`。
+- `If-None-Match`。
+- `If-Modified-Since`。
+- 单段 byte `Range` 请求。
+
+当前不支持：
+
 - 不支持 index 文件，路径必须匹配具体文件。
+- 不支持 `try_files`。
+- 不支持 autoindex。
+- 不支持多段 range。
 
 除本项目已明确要求的行为外，其它静态文件基础行为参考 nginx。
 
@@ -127,6 +135,18 @@ logs/admin.log
 - message。
 
 日志格式后续实现时可先采用 JSON Lines，便于程序解析和排查。
+
+## 当前实施顺序
+
+HTTP MVP 主体能力已经完成，后续先按小里程碑推进：
+
+1. 配置与管理 API 校验补强：已完成，当前测试基线为 40 个测试通过。
+2. 计划文档同步：更新过期 MVP 描述和当前进度。
+3. `serverName` / default server：已完成，支持同一监听地址下按 Host 选择 `http-server`，未命中时使用 default server。
+4. Proxy 常用能力：下一步，chunked 请求体流式转发、可配置请求/响应 header。
+5. 静态文件常用行为：`index`、`try_files`、更多 MIME。
+6. HTTP/2 协议正确性：RST_STREAM、WINDOW_UPDATE、SETTINGS 限制和更完整 stream 状态机。
+7. 后续再评估 TLS、管理面安全、TCP stream、限流、压缩和 metrics。
 
 ## JSON 示例
 

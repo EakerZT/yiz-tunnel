@@ -106,6 +106,7 @@ pub fn load_or_create_system_config(path: &Path) -> std::io::Result<LoadedSystem
 
     let content = fs::read_to_string(path)?;
     let config: SystemConfig = serde_json::from_str(&content)?;
+    validate_system_config(&config)?;
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
 
     let data_dir = resolve_config_path(base_dir, &config.data_dir);
@@ -126,7 +127,67 @@ fn resolve_config_path(base_dir: &Path, value: &Path) -> PathBuf {
     }
 }
 
+fn validate_system_config(config: &SystemConfig) -> std::io::Result<()> {
+    if config.version != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsupported system config version: {}", config.version),
+        ));
+    }
+
+    if config.data_dir.as_os_str().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "data-dir must not be empty",
+        ));
+    }
+
+    if config.log_dir.as_os_str().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "log-dir must not be empty",
+        ));
+    }
+
+    if config.admin.host.trim().is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "admin.host must not be empty",
+        ));
+    }
+
+    if config.admin.port == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "admin.port must not be 0",
+        ));
+    }
+
+    Ok(())
+}
+
 #[allow(dead_code)]
 fn _os_string_debug(value: OsString) -> String {
     value.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_system_config_rejects_unsupported_version() {
+        let mut config = SystemConfig::default();
+        config.version = 2;
+
+        assert!(validate_system_config(&config).is_err());
+    }
+
+    #[test]
+    fn validate_system_config_rejects_empty_admin_host() {
+        let mut config = SystemConfig::default();
+        config.admin.host = " ".to_string();
+
+        assert!(validate_system_config(&config).is_err());
+    }
 }

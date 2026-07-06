@@ -47,6 +47,7 @@ Typical use cases include:
 - Minimal HTTP/2 frame handling for SETTINGS, HEADERS, DATA, PING, CONTINUATION, and GOAWAY.
 - Basic HPACK support, including static table lookup, dynamic table indexing, and Huffman decoding.
 - Multiple HTTP server runtimes.
+- Multiple HTTP servers can share the same listen address and are selected by fixed `serverName` / `Host` matching, with the first server as the default.
 - Runtime apply/reload for a single HTTP server.
 - Server states: `starting`, `running`, `stopping`, `stopped`, `failed`.
 - Keep-alive handling.
@@ -112,7 +113,7 @@ Typical use cases include:
 - Advanced rewrite modes beyond `replacePrefix`.
 - Streaming chunked request bodies directly to upstreams.
 - Static file `index` and `try_files` behavior.
-- Full virtual host behavior for `serverName`.
+- Wildcard and regex `serverName` matching.
 - Load balancing algorithms beyond priority and round-robin.
 - Health checks for upstreams.
 - Request/response compression.

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -8,8 +9,8 @@ use uuid::Uuid;
 use crate::error::ApiError;
 use crate::model::{
     CreateHttpServerRequest, CreateRouteRequest, CreateUpstreamRequest, HttpServerConfig,
-    HttpServerFile, ProxyRewrite, RouteConfig, SetEnabledRequest, UpdateHttpServerRequest,
-    UpstreamConfig,
+    HttpServerFile, ListenConfig, ProxyRewrite, RouteConfig, SetEnabledRequest,
+    UpdateHttpServerRequest, UpstreamConfig,
 };
 
 pub struct HttpServerStorage {
@@ -52,6 +53,8 @@ impl HttpServerStorage {
     }
 
     pub fn create(&self, request: CreateHttpServerRequest) -> Result<HttpServerConfig, ApiError> {
+        validate_listen(&request.listen)?;
+        validate_graceful_type(request.graceful.r#type)?;
         validate_conf(&request.conf)?;
 
         let mut data = self.lock()?;
@@ -76,6 +79,8 @@ impl HttpServerStorage {
         id: &str,
         request: UpdateHttpServerRequest,
     ) -> Result<HttpServerConfig, ApiError> {
+        validate_listen(&request.listen)?;
+        validate_graceful_type(request.graceful.r#type)?;
         validate_conf(&request.conf)?;
 
         let mut data = self.lock()?;
@@ -139,10 +144,24 @@ impl HttpServerStorage {
         id: &str,
         request: CreateUpstreamRequest,
     ) -> Result<UpstreamConfig, ApiError> {
+        validate_upstream_request(&request)?;
         validate_conf(&request.conf)?;
 
         let mut data = self.lock()?;
         let server = find_http_server_mut(&mut data, id)?;
+
+        if !server.graceful.enabled
+            && server
+                .upstreams
+                .iter()
+                .any(|upstream| upstream.group == request.group && upstream.name == request.name)
+        {
+            return Err(ApiError::conflict(
+                40003,
+                "same group and name upstream replacement requires graceful.enabled=true",
+            ));
+        }
+
         server
             .upstreams
             .retain(|upstream| upstream.group != request.group || upstream.name != request.name);
@@ -196,6 +215,7 @@ impl HttpServerStorage {
 
         let mut data = self.lock()?;
         let server = find_http_server_mut(&mut data, id)?;
+        validate_route_upstream_target(server, &request)?;
 
         if server.routes.iter().any(|route| {
             route.match_rule.r#type == request.match_rule.r#type
@@ -271,6 +291,87 @@ fn validate_conf(value: &Value) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn validate_listen(listen: &ListenConfig) -> Result<(), ApiError> {
+    if listen.host.trim().is_empty() {
+        return Err(ApiError::invalid_request("listen.host must not be empty"));
+    }
+
+    if listen.port == 0 {
+        return Err(ApiError::invalid_request("listen.port must not be 0"));
+    }
+
+    if listen.server_name.iter().any(|name| name.trim().is_empty()) {
+        return Err(ApiError::invalid_request(
+            "listen.serverName must not contain empty names",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_graceful_type(value: u8) -> Result<(), ApiError> {
+    if value != 0 {
+        return Err(ApiError::invalid_request("graceful.type only supports 0"));
+    }
+
+    Ok(())
+}
+
+fn validate_upstream_request(request: &CreateUpstreamRequest) -> Result<(), ApiError> {
+    validate_upstream_fields(&request.group, &request.name, &request.host)
+}
+
+fn validate_upstream_config(upstream: &UpstreamConfig) -> Result<(), ApiError> {
+    if upstream.id.trim().is_empty() {
+        return Err(ApiError::invalid_request("upstream.id must not be empty"));
+    }
+
+    validate_upstream_fields(&upstream.group, &upstream.name, &upstream.host)
+}
+
+fn validate_upstream_fields(group: &str, name: &str, host: &str) -> Result<(), ApiError> {
+    if group.trim().is_empty() {
+        return Err(ApiError::invalid_request(
+            "upstream.group must not be empty",
+        ));
+    }
+
+    if name.trim().is_empty() {
+        return Err(ApiError::invalid_request("upstream.name must not be empty"));
+    }
+
+    if parse_http_upstream(host).is_none() {
+        return Err(ApiError::invalid_request(
+            "upstream.host must be an http:// host with a valid port",
+        ));
+    }
+
+    Ok(())
+}
+
+fn parse_http_upstream(value: &str) -> Option<(String, u16)> {
+    let rest = value.strip_prefix("http://")?;
+    if rest.is_empty() || rest.starts_with('/') {
+        return None;
+    }
+
+    let authority = rest.split('/').next().unwrap_or(rest);
+    if authority.contains('@') || authority.trim().is_empty() {
+        return None;
+    }
+
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host.to_string(), port.parse().ok()?),
+        None => (authority.to_string(), 80),
+    };
+
+    if host.trim().is_empty() || port == 0 {
+        None
+    } else {
+        Some((host, port))
+    }
+}
+
 fn is_supported_conf_name(name: &str) -> bool {
     matches!(
         name,
@@ -287,20 +388,72 @@ fn is_supported_conf_name(name: &str) -> bool {
 }
 
 fn validate_loaded_file(data: &HttpServerFile) -> std::io::Result<()> {
+    if data.version != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsupported http-server file version: {}", data.version),
+        ));
+    }
+
+    let mut server_ids = HashSet::new();
     for server in &data.items {
+        validate_server_config(server).map_err(api_error_to_io)?;
+        if !server_ids.insert(server.id.as_str()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("duplicate http-server id: {}", server.id),
+            ));
+        }
+
         validate_conf(&server.conf).map_err(api_error_to_io)?;
 
+        let mut upstream_ids = HashSet::new();
         for upstream in &server.upstreams {
+            validate_upstream_config(upstream).map_err(api_error_to_io)?;
+            if !upstream_ids.insert(upstream.id.as_str()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("duplicate upstream id: {}", upstream.id),
+                ));
+            }
             validate_conf(&upstream.conf).map_err(api_error_to_io)?;
         }
 
+        let mut route_ids = HashSet::new();
+        let mut route_matches = HashSet::new();
         for route in &server.routes {
             validate_route_config(route).map_err(api_error_to_io)?;
+            if !route_ids.insert(route.id.as_str()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("duplicate route id: {}", route.id),
+                ));
+            }
+            if !route_matches.insert((route.match_rule.r#type, route.match_rule.path.as_str())) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "duplicate route match.type and match.path: {} {}",
+                        route.match_rule.r#type, route.match_rule.path
+                    ),
+                ));
+            }
             validate_conf(&route.conf).map_err(api_error_to_io)?;
         }
     }
 
     Ok(())
+}
+
+fn validate_server_config(server: &HttpServerConfig) -> Result<(), ApiError> {
+    if server.id.trim().is_empty() {
+        return Err(ApiError::invalid_request(
+            "http-server.id must not be empty",
+        ));
+    }
+
+    validate_listen(&server.listen)?;
+    validate_graceful_type(server.graceful.r#type)
 }
 
 fn api_error_to_io(error: ApiError) -> std::io::Error {
@@ -318,6 +471,10 @@ fn find_http_server_mut<'a>(
 }
 
 fn validate_route_config(route: &RouteConfig) -> Result<(), ApiError> {
+    if route.id.trim().is_empty() {
+        return Err(ApiError::invalid_request("route.id must not be empty"));
+    }
+
     if route.match_rule.r#type > 1 {
         return Err(ApiError::invalid_request(
             "route match.type only supports 0(full) and 1(prefix)",
@@ -331,17 +488,16 @@ fn validate_route_config(route: &RouteConfig) -> Result<(), ApiError> {
     }
 
     match route.action.r#type.as_str() {
-        "file" if route.action.file.is_some() => Ok(()),
+        "file" if route.action.file.is_some() => {
+            validate_file_action(route.action.file.as_ref().unwrap())
+        }
         "file" => Err(ApiError::invalid_request(
             "action.file is required when action.type is file",
         )),
-        "proxy" if route.action.proxy.is_some() => validate_proxy_rewrite(
-            route
-                .action
-                .proxy
-                .as_ref()
-                .and_then(|proxy| proxy.rewrite.as_ref()),
-        ),
+        "proxy" if route.action.proxy.is_some() => {
+            let proxy = route.action.proxy.as_ref().unwrap();
+            validate_proxy_action(proxy.upstream.as_str(), proxy.rewrite.as_ref())
+        }
         "proxy" => Err(ApiError::invalid_request(
             "action.proxy is required when action.type is proxy",
         )),
@@ -366,11 +522,12 @@ fn validate_route(request: &CreateRouteRequest) -> Result<(), ApiError> {
 
     match request.action.r#type.as_str() {
         "file" => {
-            if request.action.file.is_none() {
+            let Some(file) = request.action.file.as_ref() else {
                 return Err(ApiError::invalid_request(
                     "action.file is required when action.type is file",
                 ));
-            }
+            };
+            validate_file_action(file)?;
         }
         "proxy" => {
             let Some(proxy) = request.action.proxy.as_ref() else {
@@ -378,7 +535,7 @@ fn validate_route(request: &CreateRouteRequest) -> Result<(), ApiError> {
                     "action.proxy is required when action.type is proxy",
                 ));
             };
-            validate_proxy_rewrite(proxy.rewrite.as_ref())?;
+            validate_proxy_action(proxy.upstream.as_str(), proxy.rewrite.as_ref())?;
         }
         _ => {
             return Err(ApiError::invalid_request(
@@ -388,6 +545,60 @@ fn validate_route(request: &CreateRouteRequest) -> Result<(), ApiError> {
     }
 
     Ok(())
+}
+
+fn validate_route_upstream_target(
+    server: &HttpServerConfig,
+    request: &CreateRouteRequest,
+) -> Result<(), ApiError> {
+    if request.action.r#type != "proxy" {
+        return Ok(());
+    }
+
+    let upstream_group = request
+        .action
+        .proxy
+        .as_ref()
+        .map(|proxy| proxy.upstream.as_str())
+        .unwrap_or_default();
+
+    if server
+        .upstreams
+        .iter()
+        .any(|upstream| upstream.group == upstream_group)
+    {
+        Ok(())
+    } else {
+        Err(ApiError::invalid_request(format!(
+            "route proxy.upstream group does not exist: {upstream_group}"
+        )))
+    }
+}
+
+fn validate_file_action(file: &crate::model::FileAction) -> Result<(), ApiError> {
+    if file.dir.trim().is_empty() {
+        return Err(ApiError::invalid_request(
+            "action.file.dir must not be empty",
+        ));
+    }
+
+    if file.alias > 1 {
+        return Err(ApiError::invalid_request(
+            "action.file.alias only supports 0 and 1",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_proxy_action(upstream: &str, rewrite: Option<&ProxyRewrite>) -> Result<(), ApiError> {
+    if upstream.trim().is_empty() {
+        return Err(ApiError::invalid_request(
+            "action.proxy.upstream must not be empty",
+        ));
+    }
+
+    validate_proxy_rewrite(rewrite)
 }
 
 fn validate_proxy_rewrite(rewrite: Option<&ProxyRewrite>) -> Result<(), ApiError> {
@@ -417,6 +628,8 @@ fn validate_proxy_rewrite(rewrite: Option<&ProxyRewrite>) -> Result<(), ApiError
 }
 
 fn save_transaction(path: &Path, data: &HttpServerFile) -> std::io::Result<()> {
+    validate_loaded_file(data)?;
+
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -444,7 +657,10 @@ fn new_id(prefix: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{GracefulConfig, ListenConfig};
+    use crate::model::{
+        FileAction, GracefulConfig, ListenConfig, ProxyAction, RouteAction, RouteMatch,
+        WebSocketConfig,
+    };
     use serde_json::json;
 
     #[test]
@@ -468,30 +684,7 @@ mod tests {
 
     #[test]
     fn add_upstream_replaces_same_group_and_name() {
-        let path = std::env::temp_dir().join(format!(
-            "yiz-tunnel-storage-{}.json",
-            Uuid::now_v7().simple()
-        ));
-        let storage = HttpServerStorage {
-            path: path.clone(),
-            data: Mutex::new(HttpServerFile {
-                version: 1,
-                items: vec![HttpServerConfig {
-                    id: "hs_test".to_string(),
-                    alias: "test".to_string(),
-                    enabled: true,
-                    listen: ListenConfig {
-                        host: "127.0.0.1".to_string(),
-                        port: 0,
-                        server_name: Vec::new(),
-                    },
-                    graceful: GracefulConfig::default(),
-                    conf: json!({}),
-                    upstreams: Vec::new(),
-                    routes: Vec::new(),
-                }],
-            }),
-        };
+        let (storage, path) = test_storage(true);
 
         let first = storage
             .add_upstream(
@@ -525,5 +718,166 @@ mod tests {
         assert_eq!(upstreams[0].host, "http://127.0.0.1:3001");
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn add_upstream_rejects_invalid_host() {
+        let (storage, path) = test_storage(true);
+
+        let result = storage.add_upstream(
+            "hs_test",
+            CreateUpstreamRequest {
+                group: "api".to_string(),
+                name: "v1".to_string(),
+                host: "https://127.0.0.1:3000".to_string(),
+                priority: 0,
+                conf: json!({}),
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(storage.list_upstreams("hs_test").unwrap().is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn add_upstream_rejects_replacement_when_graceful_is_disabled() {
+        let (storage, path) = test_storage(false);
+
+        storage
+            .add_upstream(
+                "hs_test",
+                CreateUpstreamRequest {
+                    group: "api".to_string(),
+                    name: "v1".to_string(),
+                    host: "http://127.0.0.1:3000".to_string(),
+                    priority: 0,
+                    conf: json!({}),
+                },
+            )
+            .unwrap();
+
+        let result = storage.add_upstream(
+            "hs_test",
+            CreateUpstreamRequest {
+                group: "api".to_string(),
+                name: "v1".to_string(),
+                host: "http://127.0.0.1:3001".to_string(),
+                priority: 0,
+                conf: json!({}),
+            },
+        );
+
+        assert!(result.is_err());
+        let upstreams = storage.list_upstreams("hs_test").unwrap();
+        assert_eq!(upstreams.len(), 1);
+        assert_eq!(upstreams[0].host, "http://127.0.0.1:3000");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn add_route_rejects_missing_proxy_upstream_group() {
+        let (storage, path) = test_storage(true);
+
+        let result = storage.add_route(
+            "hs_test",
+            CreateRouteRequest {
+                match_rule: RouteMatch {
+                    r#type: 1,
+                    path: "/api/".to_string(),
+                },
+                action: RouteAction {
+                    r#type: "proxy".to_string(),
+                    file: None,
+                    proxy: Some(ProxyAction {
+                        upstream: "api".to_string(),
+                        websocket: WebSocketConfig::default(),
+                        rewrite: None,
+                    }),
+                },
+                conf: json!({}),
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(storage.list_routes("hs_test").unwrap().is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn add_route_rejects_invalid_file_alias() {
+        let (storage, path) = test_storage(true);
+
+        let result = storage.add_route(
+            "hs_test",
+            CreateRouteRequest {
+                match_rule: RouteMatch {
+                    r#type: 1,
+                    path: "/static/".to_string(),
+                },
+                action: RouteAction {
+                    r#type: "file".to_string(),
+                    file: Some(FileAction {
+                        dir: "./public".to_string(),
+                        alias: 2,
+                    }),
+                    proxy: None,
+                },
+                conf: json!({}),
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(storage.list_routes("hs_test").unwrap().is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_rejects_unsupported_http_server_file_version() {
+        let path = std::env::temp_dir().join(format!(
+            "yiz-tunnel-storage-version-{}.json",
+            Uuid::now_v7().simple()
+        ));
+        std::fs::write(&path, r#"{"version":2,"items":[]}"#).unwrap();
+
+        assert!(HttpServerStorage::load_or_empty(path.clone()).is_err());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn test_storage(graceful_enabled: bool) -> (HttpServerStorage, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "yiz-tunnel-storage-{}.json",
+            Uuid::now_v7().simple()
+        ));
+        let storage = HttpServerStorage {
+            path: path.clone(),
+            data: Mutex::new(HttpServerFile {
+                version: 1,
+                items: vec![HttpServerConfig {
+                    id: "hs_test".to_string(),
+                    alias: "test".to_string(),
+                    enabled: true,
+                    listen: ListenConfig {
+                        host: "127.0.0.1".to_string(),
+                        port: 18080,
+                        server_name: Vec::new(),
+                    },
+                    graceful: GracefulConfig {
+                        enabled: graceful_enabled,
+                        r#type: 0,
+                    },
+                    conf: json!({}),
+                    upstreams: Vec::new(),
+                    routes: Vec::new(),
+                }],
+            }),
+        };
+
+        (storage, path)
     }
 }

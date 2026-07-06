@@ -47,6 +47,7 @@
 - 最小 HTTP/2 frame 处理，支持 SETTINGS、HEADERS、DATA、PING、CONTINUATION 和 GOAWAY。
 - 基础 HPACK 支持，包括静态表查询、动态表索引和 Huffman 解码。
 - 多 HTTP 服务运行时。
+- 多个 HTTP 服务可以共享同一监听地址，并按固定 `serverName` / `Host` 匹配选择服务，未命中时使用第一个服务作为 default server。
 - 单个 HTTP 服务的运行时应用和 reload。
 - 服务状态：`starting`、`running`、`stopping`、`stopped`、`failed`。
 - keep-alive 处理。
@@ -112,7 +113,7 @@
 - `replacePrefix` 之外的高级 rewrite 模式。
 - chunked 请求体直接流式转发到 upstream。
 - 静态文件 `index` 和 `try_files` 行为。
-- `serverName` 完整虚拟主机行为。
+- `serverName` 通配符和正则匹配。
 - priority 和 round-robin 之外的负载均衡算法。
 - upstream 健康检查。
 - 请求/响应压缩。
