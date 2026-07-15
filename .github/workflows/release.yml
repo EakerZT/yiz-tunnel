@@ -95,6 +95,8 @@ jobs:
     name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    env:
+      GH_REPO: ${{ github.repository }}
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -134,8 +136,8 @@ jobs:
           set -euo pipefail
           short_sha="${GITHUB_SHA::7}"
           tag_name="auto-build-${GITHUB_RUN_NUMBER}-${short_sha}"
-          title="自动构建版 #${GITHUB_RUN_NUMBER} (${short_sha})"
-          notes="由 GitHub Actions 自动构建，来源提交：${GITHUB_SHA}。仅包含 64 位平台产物。"
+          title="Automatic Build #${GITHUB_RUN_NUMBER} (${short_sha})"
+          notes="Automatically built by GitHub Actions from commit ${GITHUB_SHA}. Includes 64-bit platform artifacts only."
 
           gh release create "$tag_name" artifacts/* \
             --title "$title" \
